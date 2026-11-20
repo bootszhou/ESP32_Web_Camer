@@ -25,7 +25,8 @@ class WebServer {
              ConfigService* config = nullptr,
              volatile bool* settingsDirty = nullptr,
              DisplayService* display = nullptr,
-             WifiStore* wifi = nullptr);
+             WifiStore* wifi = nullptr,
+             class RelayClient* relay = nullptr);
   void end();
 
   uint32_t streamClients() const { return streamClients_; }
@@ -36,6 +37,8 @@ class WebServer {
   static esp_err_t handleSnapshot(httpd_req_t* req);
   static esp_err_t handleStream(httpd_req_t* req);
   static esp_err_t handlePlayback(httpd_req_t* req);
+  static esp_err_t handlePlaybackStatus(httpd_req_t* req);
+  static esp_err_t handlePlaybackCancel(httpd_req_t* req);
   static esp_err_t handleMotionPreview(httpd_req_t* req);
   static esp_err_t handleEvents(httpd_req_t* req);
   static esp_err_t handleEventFile(httpd_req_t* req);
@@ -71,6 +74,9 @@ class WebServer {
   // Credentials live outside ConfigService so they never appear in the public
   // settings JSON. May be null if NVS failed; the endpoints then report 503.
   WifiStore* wifi_ = nullptr;
+  // Cloud relay client (M7). May be null; the status JSON then omits relay
+  // state rather than failing.
+  class RelayClient* relay_ = nullptr;
   static uint32_t streamClients_;
   static uint32_t playbackClients_;
 };

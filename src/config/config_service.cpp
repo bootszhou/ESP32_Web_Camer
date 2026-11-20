@@ -66,6 +66,9 @@ void ConfigService::loadFromNvs() {
 
   s_.displayRotation   = getU32("disprot", s_.displayRotation);
   s_.displayBrightness = getU32("dispbrt", s_.displayBrightness);
+
+  s_.relayEnabled      = getU32("relayen", s_.relayEnabled ? 1 : 0) != 0;
+  s_.relayFps          = getU32("relayfps", s_.relayFps);
 }
 
 void ConfigService::validate() {
@@ -93,6 +96,8 @@ void ConfigService::validate() {
 
   s_.displayRotation = constrain(s_.displayRotation, 0, 3);
   s_.displayBrightness = constrain(s_.displayBrightness, 0, 255);
+
+  s_.relayFps = constrain(s_.relayFps, 1, 15);
 }
 
 bool ConfigService::save() {
@@ -119,6 +124,9 @@ bool ConfigService::save() {
 
   putOr("disprot", s_.displayRotation);
   putOr("dispbrt", s_.displayBrightness);
+
+  putOr("relayen", s_.relayEnabled ? 1 : 0);
+  putOr("relayfps", s_.relayFps);
 
   gPrefs.putUInt("ver", kVersion);
 
@@ -149,6 +157,9 @@ String ConfigService::toJson() const {
 
   doc["display_rotation"]   = s_.displayRotation;
   doc["display_brightness"] = s_.displayBrightness;
+
+  doc["relay_enabled"] = s_.relayEnabled;
+  doc["relay_fps"]     = s_.relayFps;
 
   String out;
   serializeJson(doc, out);
@@ -215,6 +226,9 @@ bool ConfigService::updateFromJson(const char* json, size_t len, String& error) 
 
   if (!asU8("display_rotation", next.displayRotation, 0, 3)) return false;
   if (!asU8("display_brightness", next.displayBrightness, 0, 255)) return false;
+
+  if (!asBool("relay_enabled", next.relayEnabled)) return false;
+  if (!asU8("relay_fps", next.relayFps, 1, 15)) return false;
 
   if (next.maxClipSec < next.clipDurationSec) {
     error = "max_clip_s must be >= clip_duration_s";

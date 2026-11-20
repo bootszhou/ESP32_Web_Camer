@@ -70,6 +70,8 @@ class UiController {
   bool menuMode_ = false;
   bool editing_ = false;
   uint8_t selected_ = 0;
+  // Auto-repeat clock for the edit-mode hold-to-decrement gesture.
+  uint32_t editRepeatMs_ = 0;
 
   // Working copy. Written to NVS only on confirm.
   ConfigService::Settings draft_{};

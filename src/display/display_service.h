@@ -26,7 +26,9 @@
 
 #include "camera/camera_service.h"
 #include "network/network_service.h"
+#include "storage/avi_reader.h"
 #include "storage/event_recorder.h"
+#include <FS.h>
 
 class DisplayService {
  public:
@@ -95,8 +97,69 @@ class DisplayService {
   // Text shown at the bottom of any page (transient status, e.g. "SAVED").
   void setHint(const char* text);
 
+  // Recent clip list for the Events page. Called by the display task itself
+  // (scanClips) -- the recorder only owns the SD card, the display just reads
+  // names from its cached copy.
+  struct ClipEntry {
+    char name[24];   // "161500_001" style short label
+    char dir[12];    // date directory "20261120"
+    uint32_t kb;     // file size in KB
+  };
+  // Scan newest-first up to kMaxClipList clips from /events. Called on the
+  // display task when the Events page repaints (SD scan is slow, so only on
+  // page change, never per frame). Returns the number found.
+  int scanClips();
+
+  // ---- on-panel clip playback -------------------------------------------
+  // Selection index into clipList_ for the Events page highlight bar.
+  // Written from the UI task, read on the display task; a torn read at worst
+  // highlights the neighbouring row for one repaint.
+  volatile int clipSelected_ = 0;
+  int clipSelected() const { return clipSelected_; }
+  void setClipSelected(int i);
+  // Clip count from the last scanClips() pass, for UI-side wrap logic.
+  int clipCountPublic() const { return clipCount_; }
+
+  // Requests playback of clipList_[index]. Actual start happens on the
+  // display task (it owns the SPI bus and the JPEG decoder). index is
+  // validated against clipCount_ there; if the list has been rescanned since,
+  // the request may be dropped or clamped.
+  void requestPlayback(int index);
+  // Stops playback (if any) and repaints the Events list. Safe from any task.
+  void stopPlayback();
+  // Pause/resume during playback. Ignored when idle.
+  void togglePause() { if (playState_ == (uint8_t)PlayState::Playing) playPaused_ = !playPaused_; }
+  bool isPlaying() const { return playState_ == (uint8_t)PlayState::Playing; }
+
  private:
+  // Playback state machine on the display task: idle -> loading -> playing.
+  // Playing replaces the preview/repaint loop; every frame is decoded with
+  // the same JPEGDEC path as the live preview, then a progress bar is drawn
+  // on top. Exit conditions: end of file, requestPlaybackStop_, or an error.
+  enum class PlayState : uint8_t { Idle = 0, Playing };
+  void startPendingPlayback();
+  void playTaskLoop();
+  void endPlayback(const char* reason);
+  // Returns true if a frame was decoded and pushed; false on decode failure
+  // (playTaskLoop counts consecutive failures and aborts the clip after a
+  // threshold, so a corrupt file cannot leave the panel frozen for minutes).
+  bool renderPlaybackFrame(const uint8_t* jpeg, size_t len, int progress);
+  void renderPlaybackOverlay(int progress, bool paused);
+
+  volatile uint8_t playState_ = (uint8_t)PlayState::Idle;
+  volatile bool playStopReq_ = false;
+  volatile int playRequest_ = -1;   // clip index to start, -1 = none
+  char playPath_[80] = {0};         // /events/<dir>/EVT_<name>.avi
+  AviReader* avi_ = nullptr;
+  uint8_t* playJpegBuf_ = nullptr;  // one-frame JPEG staging buffer (heap)
+  static constexpr size_t kPlayJpegCap = 96 * 1024;
+  bool playPaused_ = false;
+  int playProgress_ = 0;
+  int consecDecodeFails_ = 0;  // abort playback after ~30 bad frames in a row
   static constexpr int kMaxMenuRows = 6;
+  static constexpr int kMaxClipList = 4;
+  ClipEntry clipList_[kMaxClipList];
+  int clipCount_ = 0;
 
   void initSpi();
   void initSt7789();
@@ -115,6 +178,24 @@ class DisplayService {
   void drawFrameRect(int x, int y, int w, int h, uint16_t color);
   void renderTextPage(Page p);
   void renderPreviewChrome();
+
+  // ---- refined-UI primitives (theme in display_service.cpp) ---------------
+  // Rounded-corner filled panel. radius clamped to h/2; corners drawn with
+  // quarter steps, interior with one fillRect (cheap: 3 window writes).
+  void drawCard(int x, int y, int w, int h, uint16_t color, int radius = 6);
+  // Horizontal progress bar with rounded ends and a 1px darker track border.
+  void drawBar(int x, int y, int w, int h, int percent, uint16_t fill,
+               uint16_t track);
+  // Filled circle (midpoint scanline, used for status dots and icons).
+  void fillCircle(int cx, int cy, int r, uint16_t color);
+  // Small glyphs: wifi arcs, rec dot, SD card, relay dish, lock. Bounded and
+  // filled primitives only -- no external font dependency.
+  void drawWifiIcon(int x, int y, bool ok);
+  void drawRecIcon(int x, int y, bool blinkOn);
+  void drawSdIcon(int x, int y, int fillPercent);
+  void drawRelayIcon(int x, int y, bool live);
+  // Large numeric readout (3x5 pixel digits, scale applied).
+  void drawBigNum(int x, int y, const char* s, uint16_t color, int scale);
 
   CameraService* camera_ = nullptr;
   NetworkService* network_ = nullptr;

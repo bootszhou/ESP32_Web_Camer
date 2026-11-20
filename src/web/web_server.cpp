@@ -4,6 +4,8 @@
 #include <SD_MMC.h>
 #include <sys/socket.h>   // setsockopt / SO_SNDTIMEO for the stream socket
 
+#include "network/relay_client.h"
+
 namespace {
 
 constexpr const char* kBoundary = "camai_frame_boundary";
@@ -18,9 +20,12 @@ constexpr uint32_t kMaxStreamClients = 1;
 // web_server.h. The page and API stay on port 80.
 constexpr uint16_t kStreamPort = 81;
 
-// One playback session at a time, independent of the live stream: SD reads
-// and WiFi airtime are both finite, and nobody needs two replays at once.
-constexpr uint32_t kMaxPlaybackClients = 1;
+// Playback is independent of the live stream. Normally just one replay runs,
+// but switching clips mid-play briefly overlaps the outgoing connection with
+// the incoming one until the old loop notices its token was superseded. Allow
+// a small headroom for that transition; token preemption (not this counter)
+// is what guarantees only one replay actually streams at a time.
+constexpr uint32_t kMaxPlaybackClients = 4;
 
 // Pause between streamed frames.
 //
@@ -35,6 +40,27 @@ constexpr uint32_t kStreamYieldMs = 40;
 
 uint32_t gLastStreamFrameMs = 0;
 uint32_t gStreamFrameCount = 0;
+
+// Live progress of the active replay, published by handlePlayback and read by
+// /api/v1/playback/status. Most fields are written by the single stream task
+// and read by an API task, so make them volatile. gPlaybackToken is ALSO
+// written by the port-80 /playback/cancel handler: bumping it mid-replay is how
+// the browser tells an in-flight stream to stop so a newly selected clip can
+// claim the single-task port-81 server immediately. token ties a reading to
+// one particular playClip() request so a late client cannot observe a new
+// replay's progress under an old request's identity.
+volatile uint32_t gPlaybackToken = 0;
+volatile bool gPlaybackActive = false;
+// Set by /playback/cancel when it bumps the token: the UI has asked for a new
+// clip but that clip's handler has not published a snapshot yet. Without this
+// flag the status endpoint reports the freshly bumped token with active=false,
+// which the browser cannot tell apart from "the clip finished", so it tore the
+// progress bar down in the gap between the cancel POST and the new handler.
+volatile bool gPlaybackPending = false;
+volatile uint32_t gPlaybackFramesDone = 0;
+volatile uint32_t gPlaybackFramesTotal = 0;
+volatile uint32_t gPlaybackStartMs = 0;
+volatile uint32_t gPlaybackDurationMs = 0;
 
 const char* kIndexHtml = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN">
@@ -75,6 +101,11 @@ const char* kIndexHtml = R"HTML(<!DOCTYPE html>
     background: rgba(13,17,23,.92); text-align: center; padding: 20px;
   }
   .overlay.hidden { display: none; }
+  .pbtrack {
+    flex: 1; min-width: 90px; height: 8px; background: #21262d;
+    border: 1px solid #30363d; border-radius: 5px; overflow: hidden;
+  }
+  .pbfill { height: 100%; width: 0%; background: #d29922; transition: width .2s linear; }
   .btn {
     background: #238636; border: 1px solid #2ea043; color: #fff;
     padding: 9px 18px; border-radius: 7px; font-size: 14px; cursor: pointer;
@@ -165,6 +196,8 @@ const char* kIndexHtml = R"HTML(<!DOCTYPE html>
   <div id="playbackBar"
        style="display:none;max-width:960px;width:100%;margin:6px auto 0;align-items:center;gap:10px;color:#d29922;font-size:13px">
     回放中：<span id="playbackName"></span>
+    <div class="pbtrack"><div class="pbfill" id="pbFill"></div></div>
+    <span id="pbTime" style="font-variant-numeric:tabular-nums;min-width:86px;text-align:right"></span>
     <button class="btn" id="backLiveBtn" style="font-size:12px;padding:3px 10px">返回直播</button>
   </div>
   <div id="liveBar"
@@ -242,6 +275,9 @@ const char* kIndexHtml = R"HTML(<!DOCTYPE html>
       <input type="checkbox" id="s_autoclean"></div>
     <div class="row"><label for="s_vflip">画面上下翻转</label>
       <input type="checkbox" id="s_vflip" checked></div>
+    <div class="row"><label for="s_hflip">画面左右翻转 (镜像)</label>
+      <small class="hint">默认开启：校正传感器镜像；文字应为正向可读</small>
+      <input type="checkbox" id="s_hflip" checked></div>
     <div class="row"><label>屏幕方向<br>
       <small class="hint">依次点击找到正确方向</small></label>
       <button class="btn" id="rotBtn" style="font-size:12px;padding:3px 12px">
@@ -286,6 +322,7 @@ const overlay = document.getElementById('overlay');
 const startBtn = document.getElementById('startBtn');
 const overlayText = document.getElementById('overlayText');
 let streaming = false;
+let streamStaleCount = 0;  // consecutive polls with a stalled stream frame age
 
 // 1x1 transparent GIF used to park the <img> when no video is wanted.
 // Assigning src='' instead would make the browser re-request the page itself
@@ -298,11 +335,37 @@ function detachCam() {
   cam.src = BLANK_PIXEL;
 }
 
-function startStream() {
+// Asks the device for the token to use for the next replay, and returns a
+// promise for it. The token MUST come from the device: it is the device that
+// compares tokens to decide whether a queued /playback request is stale, so
+// only a device-issued number is guaranteed to be newer than the last one it
+// saw. A page-minted counter restarts at 0 on reload and gets rejected.
+//
+// The POST also bumps the device token, which is exactly what frees a busy
+// port-81 task for the request that follows.
+function requestPlayToken() {
+  return fetch('/api/v1/playback/cancel', { method: 'POST', cache: 'no-store' })
+    .then(r => r.json())
+    .then(d => (d && d.token) ? d.token : 0)
+    .catch(() => 0);  // 0 means "tokenless": the device still serves the request
+}
+
+async function startStream() {
   // The MJPEG stream is served by a dedicated httpd instance on port 81 so
   // that the page and API on port 80 stay responsive while it runs.
   // streaming flips first so a late error event from the connection being
   // replaced cannot be mistaken for a failure of the new one.
+  // Leaving any replay behind: invalidate its token and polling so a late
+  // playback status response cannot put the idle overlay back over the stream.
+  stopPlaybackPolling();
+  const gen = ++playbackToken;
+  // Wait for the reservation before touching cam.src. Requests this page fires
+  // at the same moment are otherwise ordered by the network, and a cancel that
+  // landed after the stream got one would bump the device token while the
+  // stream was running.
+  const token = await requestPlayToken();
+  if (gen !== playbackToken) return;  // a replay was picked while waiting
+  setProgressBar(0, 0, 0);
   streaming = true;
   document.getElementById('playbackBar').style.display = 'none';
   document.getElementById('liveBar').style.display = 'flex';
@@ -318,23 +381,134 @@ function stopStream() {
   overlay.classList.remove('hidden');
 }
 
+// ---- playback state -------------------------------------------------------
+// The device serves an AVI clip as an MJPEG stream on port 81. The browser
+// cannot know how many frames an MJPEG <img> has decoded, so progress comes
+// from a lightweight /playback/status poll on port 80. Each replay gets a
+// unique token; a stale poll response for an old token is ignored, which is
+// what makes switching clips mid-playback take effect immediately instead of
+// being overwritten by an in-flight response from the previous clip.
+// Page-local generation guard. Only decides which pending continuation in
+// this tab is still current; it is NOT sent to the device. The device issues
+// its own playback token (see requestPlayToken) because a page-local counter
+// restarted at 0 on every reload while the device kept counting, so a fresh
+// page's tokens were always OLDER than the device's and handlePlayback()
+// rejected every replay as "superseded" (409) — playback stopped working.
+let playbackToken = 0;
+let playbackTimer = null;
+let pbPollCount = 0;
+
+function setProgressBar(pct, elapsedMs, durationMs) {
+  const fill = document.getElementById('pbFill');
+  const time = document.getElementById('pbTime');
+  if (!fill || !time) return;
+  if (durationMs > 0) {
+    const capped = Math.max(0, Math.min(100, pct));
+    fill.style.width = capped + '%';
+    time.textContent = fmtTime(elapsedMs) + ' / ' + fmtTime(durationMs);
+  } else {
+    fill.style.width = '0%';
+    time.textContent = '';
+  }
+}
+
+function fmtTime(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return String(Math.floor(s / 60)).padStart(2, '0') + ':' +
+         String(s % 60).padStart(2, '0');
+}
+
+// Called when a replay finishes naturally: tear down the stream and return
+// the view to the idle "开始直播" overlay.
+function playbackFinished() {
+  stopPlaybackPolling();
+  playbackToken++;
+  streaming = false;
+  detachCam();
+  document.getElementById('playbackBar').style.display = 'none';
+  setProgressBar(0, 0, 0);
+  overlayText.textContent = '点击开始观看';
+  overlay.classList.remove('hidden');
+}
+
+async function pollPlayback(token, gen) {
+  if (gen !== playbackToken) return;  // a newer clip / live view took over
+  try {
+    const r = await fetch('/api/v1/playback/status?t=' + Date.now(),
+                          { cache: 'no-store' });
+    const d = await r.json();
+    if (gen !== playbackToken) return;  // switched while the request was out
+    // A response for a different token belongs to a replay we have already
+    // left (the new /playback request has not reached the device yet). Ignore
+    // it and let the next tick pick up the new token.
+    if (d.token !== token) return;
+    // The cancel POST bumps the token the moment it frees port 81, but the new
+    // clip's handler has not published its snapshot yet. That window reports
+    // this token with active=false; treating it as end-of-clip tore the
+    // progress bar down just as the new clip was about to start, which is why
+    // a switched clip showed no time/duration. Wait for the handler instead.
+    if (d.pending) return;
+    // The device flips active=false when the frame loop ends: that is a
+    // natural end-of-clip, so return the view to the idle screen.
+    if (!d.active) { playbackFinished(); return; }
+    setProgressBar(d.progress || 0, d.elapsed_ms || 0, d.duration_ms || 0);
+  } catch (e) { /* device offline; next tick retries */ }
+}
+
+function stopPlaybackPolling() {
+  if (playbackTimer !== null) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+  }
+}
+
 // Replays a recorded clip in the same <img> view: the device re-serves the
 // AVI's JPEG frames as an MJPEG stream on the port-81 instance, so no
 // browser-side video decoding is needed.
-function playClip(dir, name) {
+async function playClip(dir, name) {
+  // Invalidate any replay still in flight, then hard-reset its connection:
+  // assigning the new URL immediately aborts the old MJPEG fetch on port 81,
+  // so the new clip starts at once instead of waiting for the old one to end.
+  stopPlaybackPolling();
+  const gen = ++playbackToken;
   streaming = false;
   document.getElementById('liveBar').style.display = 'none';
   document.getElementById('playbackName').textContent =
     (dir ? dir + '  ' : '') + name.replace('.avi', '');
   document.getElementById('playbackBar').style.display = 'flex';
-  cam.src = 'http://' + location.hostname + ':81/playback?dir=' +
-            encodeURIComponent(dir) + '&name=' + encodeURIComponent(name);
+  setProgressBar(0, 0, 0);
   overlay.classList.add('hidden');
   window.scrollTo({ top: 0, behavior: 'smooth' });
+
+  // Take the token from the device (it also frees the busy port-81 task), so
+  // the number this request carries is always newer than anything the device
+  // has seen. Minting one here broke playback after a page reload.
+  const token = await requestPlayToken();
+  if (gen !== playbackToken) return;  // another clip was picked while waiting
+  cam.src = 'http://' + location.hostname + ':81/playback?dir=' +
+            encodeURIComponent(dir) + '&name=' + encodeURIComponent(name) +
+            '&token=' + token;
+
+  pbPollCount = 0;
+  pollPlayback(token, gen);  // fast first update
+  // The cancel POST and the new /playback GET race across two HTTP servers;
+  // the very first poll usually still sees the old token. Retry quickly so the
+  // new clip's time/duration label appears promptly instead of after 500 ms.
+  setTimeout(() => pollPlayback(token, gen), 120);
+  playbackTimer = setInterval(() => {
+    pollPlayback(token, gen);
+    // Absolute safety net: clips can be up to 120 s and "extend on motion"
+    // can make them longer, so give the device ample margin before giving up
+    // on a replay that never reported "done" (e.g. a truncated AVI).
+    if (++pbPollCount > 400) playbackFinished();
+  }, 500);
 }
 
 document.getElementById('backLiveBtn').addEventListener('click', () => {
-  detachCam();  // drop the playback connection before reopening the stream
+  stopPlaybackPolling();
+  playbackToken++;  // abandon any in-flight replay
+  detachCam();      // drop the playback connection before reopening the stream
+  setProgressBar(0, 0, 0);
   startStream();
 });
 
@@ -407,6 +581,36 @@ async function poll() {
       st.mounted ? (st.clips + ' 段') : '无 SD';
     document.getElementById('sd').textContent =
       st.mounted ? (st.free_mb + ' MB') : '--';
+
+    // ---- live-stream watchdog ------------------------------------------------
+    // The MJPEG <img> gives no error event when the device side stops sending
+    // (the TCP connection just goes quiet), so a frozen stream must be detected
+    // from the device's own status. Two conditions mean "stuck":
+    //   (a) device reports no stream client although we think we're watching,
+    //   (b) the newest streamed frame is older than 3 s.
+    // Two consecutive polls (~2 s) trigger one automatic reconnect; the guard
+    // avoids reloading src on every poll while the reconnect is pending.
+    const ageEl = s.stream_frame_age_ms || 0;
+    const clientsEl = s.stream_clients || 0;
+    const stuck = (streaming && (clientsEl === 0 || ageEl > 3000));
+    if (stuck) {
+      streamStaleCount++;
+      if (streamStaleCount >= 2) {
+        streamStaleCount = 0;
+        const ov = document.getElementById('overlayText');
+        if (ov) ov.textContent = '直播中断，正在重连…';
+        // A cache-busting t forces a fresh request; reassigning src also tears
+        // down the dead connection server-side via the socket close.
+        cam.src = BLANK_PIXEL;
+        setTimeout(() => {
+          if (streaming) {
+            cam.src = 'http://' + location.hostname + ':81/stream?t=' + Date.now();
+          }
+        }, 300);
+      }
+    } else {
+      streamStaleCount = 0;
+    }
 
     document.getElementById('footer').textContent =
       'CAM-AI · ' + s.ip + ' · ' + s.firmware +
@@ -738,6 +942,7 @@ const CFG_CHECKS = [
   ['s_extend','extend_on_motion'],
   ['s_autoclean','auto_clean'],
   ['s_vflip','vflip'],
+  ['s_hflip','hflip'],
 ];
 
 // Keep the numeric label in sync while dragging.
@@ -886,7 +1091,8 @@ uint32_t WebServer::playbackClients_ = 0;
 bool WebServer::begin(CameraService* camera, NetworkService* network,
                       MotionDetector* motion, EventRecorder* recorder,
                       ConfigService* config, volatile bool* settingsDirty,
-                      DisplayService* display, WifiStore* wifi) {
+                      DisplayService* display, WifiStore* wifi,
+                      RelayClient* relay) {
   camera_ = camera;
   network_ = network;
   motion_ = motion;
@@ -895,6 +1101,7 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
   settingsDirty_ = settingsDirty;
   display_ = display;
   wifi_ = wifi;
+  relay_ = relay;
   instance_ = this;
 
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
@@ -921,6 +1128,10 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
                            .handler = handleMotionPreview, .user_ctx = nullptr};
   httpd_uri_t uriEvents = {.uri = "/api/v1/events", .method = HTTP_GET,
                            .handler = handleEvents, .user_ctx = nullptr};
+  httpd_uri_t uriPbStatus = {.uri = "/api/v1/playback/status", .method = HTTP_GET,
+                             .handler = handlePlaybackStatus, .user_ctx = nullptr};
+  httpd_uri_t uriPbCancel = {.uri = "/api/v1/playback/cancel", .method = HTTP_POST,
+                             .handler = handlePlaybackCancel, .user_ctx = nullptr};
   httpd_uri_t uriEventFile = {.uri = "/api/v1/events/file", .method = HTTP_GET,
                               .handler = handleEventFile, .user_ctx = nullptr};
   httpd_uri_t uriEventDel = {.uri = "/api/v1/events/delete", .method = HTTP_POST,
@@ -949,6 +1160,8 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
   httpd_register_uri_handler(server_, &uriSnap);
   httpd_register_uri_handler(server_, &uriMotion);
   httpd_register_uri_handler(server_, &uriEvents);
+  httpd_register_uri_handler(server_, &uriPbStatus);
+  httpd_register_uri_handler(server_, &uriPbCancel);
   httpd_register_uri_handler(server_, &uriEventFile);
   httpd_register_uri_handler(server_, &uriEventDel);
   httpd_register_uri_handler(server_, &uriGetCfg);
@@ -1013,8 +1226,9 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
   MotionDetector* mo = self->motion_;
   EventRecorder* rec = self->recorder_;
   const EventRecorder::Status* rs = rec ? &rec->status() : nullptr;
+  const RelayClient::Status* rly = self->relay_ ? &self->relay_->status() : nullptr;
 
-  char json[1024];
+  char json[1280];
   snprintf(json, sizeof(json),
            "{"
            "\"wifi_connected\":%s,"
@@ -1029,7 +1243,17 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
            "\"heap_free\":%u,"
            "\"psram_free\":%u,"
            "\"stream_clients\":%lu,"
+           "\"stream_frame_age_ms\":%lu,"
            "\"provisioning\":%s,"
+           "\"relay\":{"
+             "\"enabled\":%s,"
+             "\"connected\":%s,"
+             "\"viewer\":%s,"
+             "\"frames_sent\":%lu,"
+             "\"bytes_sent\":%lu,"
+             "\"reconnects\":%lu,"
+             "\"last_error\":\"%s\""
+           "},"
            "\"motion\":{"
              "\"ready\":%s,"
              "\"active\":%s,"
@@ -1070,7 +1294,22 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
            ESP.getFreeHeap(),
            ESP.getFreePsram(),
            (unsigned long)self->streamClients(),
+           // Age of the newest streamed frame. Do NOT gate on streamClients():
+           // when the stream handler dies the client count drops to 0, and the
+           // browser (whose <img> is frozen) needs to see a LARGE age to trigger
+           // the reconnect watchdog. Gating here used to force age=0 and the
+           // watchdog never fired.
+           (gLastStreamFrameMs != 0)
+               ? (unsigned long)(millis() - gLastStreamFrameMs)
+               : 0UL,
            (net && net->provisioningActive()) ? "true" : "false",
+           rly && rly->enabled ? "true" : "false",
+           rly && rly->connected ? "true" : "false",
+           rly && rly->viewerActive ? "true" : "false",
+           rly ? (unsigned long)rly->framesSent : 0,
+           rly ? (unsigned long)rly->bytesSent : 0,
+           rly ? (unsigned long)rly->reconnects : 0,
+           rly ? rly->lastError : "",
            (mo && mo->lastAnalysisMs() > 0) ? "true" : "false",
            (mo && mo->isActive()) ? "true" : "false",
            mo ? mo->lastChangedBlocks() : 0,
@@ -1094,7 +1333,7 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
            rs ? (unsigned long)rs->totalMb : 0,
            rs ? (unsigned long)rs->framesDropped : 0,
            rs ? rs->lastError : "",
-           "0.5.0");
+           "0.6.0");
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1816,29 +2055,44 @@ esp_err_t WebServer::handleStream(httpd_req_t* req) {
   char partHeader[96];
   uint32_t frames = 0;
   uint32_t startMs = millis();
+  int sendFails = 0;  // consecutive send failures; tolerate transient timeouts
 
-  // Bound how long a single send may block.
-  //
-  // httpd_resp_send_chunk() blocks while the TCP window is full. With one
-  // httpd task that stalled every other URI, so /api/v1/status timed out for as
-  // long as a viewer kept the socket busy -- which is what froze the motion
-  // readout. A short send timeout makes the task return to the server loop
-  // quickly; the browser simply sees a slightly uneven frame rate.
+  // This handler owns its own httpd task (port 81), so it no longer competes
+  // with the API task on port 80 -- a generous send timeout is safe here and
+  // avoids killing the whole stream on one transient TCP-window stall.
   int sockfd = httpd_req_to_sockfd(req);
   if (sockfd >= 0) {
     struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;  // 200 ms
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;  // 1000 ms (was 200 ms: too eager, caused frozen streams)
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   }
+
+  // A fresh stream starts with a clean frame-age budget: a stale timestamp
+  // from a previous (dead) stream must not fool the browser watchdog.
+  gLastStreamFrameMs = millis();
+
+  // Reset whenever a frame DOES arrive; grown while none does. Scoped to this
+  // handler call so each stream starts with a clean 5 s budget.
+  uint32_t noFrameSinceMs = 0;
 
   while (res == ESP_OK) {
     camera_fb_t* fb = self->camera_->acquire(1000);
     if (!fb) {
-      // Sensor hiccup: brief pause, then try again rather than killing the stream.
+      // Sensor hiccup: brief pause, then try again rather than killing the
+      // stream. But if no frame arrives for 5 s the sensor is wedged for real
+      // (or the camera was reconfigured mid-stream); end the stream so the
+      // socket closes and the browser's watchdog can reconnect, instead of
+      // spinning here forever holding streamClients_ at 1.
+      if (noFrameSinceMs == 0) noFrameSinceMs = millis();
+      if (millis() - noFrameSinceMs >= 5000) {
+        Serial.println("[web] stream: no frames for 5s, closing");
+        break;
+      }
       delay(20);
       continue;
     }
+    noFrameSinceMs = 0;
 
     if (fb->format != PIXFORMAT_JPEG) {
       self->camera_->release(fb);
@@ -1857,7 +2111,21 @@ esp_err_t WebServer::handleStream(httpd_req_t* req) {
     }
     self->camera_->release(fb);
 
-    if (res != ESP_OK) break;  // browser went away
+    if (res != ESP_OK) {
+      // A single timeout (SO_SNDTIMEO) is usually a transient TCP-window stall,
+      // NOT a disconnect. Breaking here used to freeze the MJPEG <img> forever
+      // because the browser gets no error event for a silently closed stream.
+      // Tolerate a few consecutive failures; only treat it as a real goodbye
+      // after several, and let the frontend watchdog cover the rest.
+      if (++sendFails >= 5) {
+        Serial.printf("[web] stream: %d consecutive send fails, closing\n",
+                      sendFails);
+        break;
+      }
+      delay(50);
+      continue;
+    }
+    sendFails = 0;
 
     frames++;
     gLastStreamFrameMs = millis();
@@ -1902,9 +2170,10 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
     return ESP_OK;
   }
 
-  char query[128];
+  char query[256];
   char dir[40] = {0};
   char name[64] = {0};
+  char tokenStr[16] = {0};
   if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
     httpd_resp_set_status(req, "400 Bad Request");
     httpd_resp_send(req, "bad request", HTTPD_RESP_USE_STRLEN);
@@ -1912,6 +2181,8 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
   }
   httpd_query_key_value(query, "dir", dir, sizeof(dir));
   httpd_query_key_value(query, "name", name, sizeof(name));
+  httpd_query_key_value(query, "token", tokenStr, sizeof(tokenStr));
+  const uint32_t token = (uint32_t)strtoul(tokenStr, nullptr, 10);
 
   // Same traversal guard as the download endpoint: only plain filenames.
   auto unsafe = [](const char* s) {
@@ -1968,7 +2239,8 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
   uint8_t head[512];
   const size_t hn = f.read(head, sizeof(head));
 
-  uint32_t frameMs = 100;  // fallback 10 fps; avih overrides
+  uint32_t frameMs = 100;         // fallback 10 fps; avih overrides
+  uint32_t totalFrames = 0;       // dwTotalFrames from avih, if present
   for (size_t i = 0; i + 12 <= hn; i++) {
     if (memcmp(head + i, "avih", 4) == 0) {
       uint32_t usec = (uint32_t)head[i + 8] | ((uint32_t)head[i + 9] << 8) |
@@ -1979,11 +2251,21 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
         if (frameMs < 20) frameMs = 20;     // do not outrun the network
         if (frameMs > 1000) frameMs = 1000;
       }
+      // dwTotalFrames is the 5th field of the avih payload. Relative to the
+      // 'avih' FourCC at i: +4 size, +8 usec, +12 maxBps, +16 padding,
+      // +20 flags, then +24..27 = dwTotalFrames. Reading +20 mistakenly
+      // returns dwFlags (0x10 = 16), which made every clip look ~1.6 s long.
+      if (i + 28 <= hn) {
+        totalFrames = (uint32_t)head[i + 24] | ((uint32_t)head[i + 25] << 8) |
+                      ((uint32_t)head[i + 26] << 16) |
+                      ((uint32_t)head[i + 27] << 24);
+      }
       break;
     }
   }
 
   uint32_t moviEnd = 0;
+  uint32_t moviStart = 0;
   bool foundMovi = false;
   for (size_t i = 8; i + 4 <= hn; i++) {
     if (memcmp(head + i, "movi", 4) == 0 &&
@@ -1992,7 +2274,7 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
                        ((uint32_t)head[i - 2] << 16) |
                        ((uint32_t)head[i - 1] << 24);
       // 'head' starts at absolute offset 12 (the RIFF magic was consumed).
-      const uint32_t moviStart = 12 + (uint32_t)i + 4;
+      moviStart = 12 + (uint32_t)i + 4;
       moviEnd = moviStart + (lsize > 4 ? lsize - 4 : 0);
       f.seek(moviStart);
       foundMovi = true;
@@ -2007,6 +2289,44 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
     return ESP_OK;
   }
 
+  // Old clips can carry an unpatched dwTotalFrames (0). If so, recover the
+  // frame count from the idx1 index at the end of the file: every entry is
+  // 16 bytes and the index declares its own byte size. This is a bounded read
+  // of the tail, independent of the number of frames.
+  if (totalFrames == 0) {
+    const uint32_t fileLen = f.size();
+    if (fileLen >= 8) {
+      f.seek(fileLen - 8);
+      uint8_t tail[8];
+      if (f.read(tail, 8) == 8 && memcmp(tail, "idx1", 4) == 0) {
+        uint32_t idxSize = (uint32_t)tail[4] | ((uint32_t)tail[5] << 8) |
+                           ((uint32_t)tail[6] << 16) | ((uint32_t)tail[7] << 24);
+        // The idx1 chunk sits immediately before its 8-byte header at EOF.
+        if (idxSize >= 16 && idxSize <= fileLen - 8) {
+          totalFrames = idxSize / 16;
+        }
+      }
+    }
+    f.seek(moviStart);  // restore the frame-reading position
+  }
+
+  // A newer replay may already have claimed playback while this request was
+  // queued behind the previous one on the single-task port-81 server. The
+  // browser bumps the token through /playback/cancel before every switch, so
+  // a request that arrives with a token older than the current one belongs to
+  // a clip the user has already left. Publishing it here would drag the token
+  // backwards and flip active back to true, resurrecting a replay the UI has
+  // already torn down — that is what made a finished clip appear to play
+  // itself a second time. Drop the request instead. A request with no token at
+  // all (a hand-typed/bookmarked URL) is exempt: it carries no ordering
+  // information, so it is served and adopts the current token order.
+  if (token != 0 && token < gPlaybackToken) {
+    httpd_resp_set_status(req, "409 Conflict");
+    httpd_resp_send(req, "superseded", HTTPD_RESP_USE_STRLEN);
+    f.close();
+    return ESP_OK;
+  }
+
   playbackClients_++;
 
   esp_err_t res = httpd_resp_set_type(req, kStreamContentType);
@@ -2015,13 +2335,18 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
     httpd_resp_set_hdr(req, "X-Accel-Buffering", "no");
   }
 
-  // Same reasoning as the live stream: never let a stalled viewer block this
-  // task's other sockets forever.
+  // Bound how long a single send may block, so a dead viewer cannot park this
+  // task forever. Playback gets a much more generous bound than the live
+  // stream: its sends are large whole frames and the frame pacing deliberately
+  // idles the socket between them, so a 200 ms cap — fine for the live path,
+  // where a dropped frame just means the browser reconnects — aborted the
+  // whole replay instead. Measured 86-frame run: 7 sends exceeded 300 ms and
+  // one tripped the cap mid-clip, which the UI then showed as "finished".
   int sockfd = httpd_req_to_sockfd(req);
   if (sockfd >= 0) {
     struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200000;  // 200 ms
+    tv.tv_sec = 1;
+    tv.tv_usec = 500000;  // 1500 ms
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
   }
 
@@ -2029,12 +2354,47 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
   uint8_t buf[1408];
   uint32_t frames = 0;
   uint32_t startMs = millis();
+  // Why the frame loop stopped. An unexplained early stop is much harder to
+  // chase from the outside, so record the exact exit path in the log.
+  const char* stopReason = "eof";
+
+  // Whole-frame staging buffer so one JPEG goes out in a single send_chunk()
+  // like the live stream, instead of ~16 calls through the small buffer below.
+  // 48 KB covers the recorder's usual frame size; anything larger falls back to
+  // the incremental loop. Allocated once per replay and freed on every exit.
+  static const size_t kFrameBufMax = 48 * 1024;
+  uint8_t* frameBuf = (uint8_t*)malloc(kFrameBufMax);
+  if (frameBuf == nullptr) {
+    Serial.println("[web] playback: frame buffer alloc failed, using small buffer");
+  }
+  // Timing split: SD read vs socket send. A slow replay could be either, and
+  // the two need very different fixes, so measure instead of guessing.
+  uint32_t dbgReadMs = 0, dbgSendMs = 0, dbgSlowSends = 0;
+
+  // Publish the initial progress snapshot. duration_ms uses the avih frame
+  // period when the frame count is known; otherwise it stays 0 and the UI
+  // shows the bar without a time label until more data is available.
+  // A tokenless request (hand-opened URL) keeps the current token order rather
+  // than resetting it to 0, which would let a later stale request through the
+  // superseded check above.
+  if (token != 0) gPlaybackToken = token;
+  // Identity this stream uses for every ownership check below. A tokenless
+  // request adopts the order it just published instead of comparing against 0,
+  // which would make its own loop exit on the very first frame.
+  const uint32_t myToken = gPlaybackToken;
+  gPlaybackFramesDone = 0;
+  gPlaybackFramesTotal = totalFrames;
+  gPlaybackStartMs = startMs;
+  gPlaybackDurationMs = (totalFrames > 0 && frameMs > 0)
+                          ? totalFrames * frameMs : 0;
+  gPlaybackActive = true;
+  gPlaybackPending = false;  // this handler owns the token now
 
   while (res == ESP_OK && f.position() + 8 <= moviEnd) {
     char id[5];
     uint32_t len;
-    if (!readChunkHeader(id, &len)) break;
-    if (memcmp(id, "idx1", 4) == 0) break;  // index: end of frames
+    if (!readChunkHeader(id, &len)) { stopReason = "chunk-header-eof"; break; }
+    if (memcmp(id, "idx1", 4) == 0) { stopReason = "idx1"; break; }
 
     if (memcmp(id, "00dc", 4) != 0 && memcmp(id, "00db", 4) != 0) {
       // Unknown chunk inside movi: skip rather than abort.
@@ -2048,29 +2408,167 @@ esp_err_t WebServer::handlePlayback(httpd_req_t* req) {
                         kBoundary, (unsigned)len);
     res = httpd_resp_send_chunk(req, partHeader, hlen);
 
-    uint32_t remaining = len;
-    while (res == ESP_OK && remaining > 0) {
-      size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
-      size_t n = f.read(buf, want);
-      if (n == 0) {
-        res = ESP_FAIL;  // truncated file
+    // Send the JPEG with as few send_chunk() calls as possible.
+    //
+    // The live stream hands the whole frame to one call; replay used to stage
+    // it through a 1408-byte buffer, turning a ~20 KB frame into ~16 separate
+    // chunked sends. Each call pays chunk-header and socket overhead, and the
+    // per-send SO_SNDTIMEO applies to every one of them, so replay measured
+    // ~28 KB/s against ~111 KB/s on the live path and could time out mid-clip
+    // (which looked like the replay ending early). A reusable frame buffer
+    // restores one send per frame; frames larger than the buffer still fall
+    // back to the streaming loop.
+    if (len <= kFrameBufMax && frameBuf != nullptr) {
+      uint32_t tR0 = millis();
+      size_t got = f.read(frameBuf, len);
+      uint32_t tR1 = millis();
+      if (got != len) {
+        res = ESP_FAIL;
+        stopReason = "file-truncated";
         break;
       }
-      res = httpd_resp_send_chunk(req, (const char*)buf, n);
-      remaining -= n;
+      res = httpd_resp_send_chunk(req, (const char*)frameBuf, len);
+      uint32_t tR2 = millis();
+      dbgReadMs += (tR1 - tR0);
+      dbgSendMs += (tR2 - tR1);
+      if (tR2 - tR1 > 300) dbgSlowSends++;
+    } else {
+      uint32_t remaining = len;
+      while (res == ESP_OK && remaining > 0) {
+        size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        size_t n = f.read(buf, want);
+        if (n == 0) {
+          res = ESP_FAIL;  // truncated file
+          stopReason = "file-truncated";
+          break;
+        }
+        res = httpd_resp_send_chunk(req, (const char*)buf, n);
+        remaining -= n;
+      }
     }
     if (len & 1) f.seek(f.position() + 1);  // RIFF word alignment
-    if (res != ESP_OK) break;               // browser went away
+    if (res != ESP_OK) { stopReason = "send-failed"; break; }  // client gone
 
     frames++;
-    delay(frameMs);
+    // Only the replay that still owns the token may publish its progress. A
+    // stale connection unwinding after a clip switch must not overwrite the
+    // new clip's counter (otherwise the progress bar jumps back to zero).
+    if (myToken == gPlaybackToken) gPlaybackFramesDone = frames;
+    // If a newer clip has claimed playback, stop pushing frames now. In the
+    // single-task stream server a new handler cannot start until we return,
+    // but this also covers builds that run URI handlers concurrently.
+    if (myToken != gPlaybackToken) { stopReason = "superseded"; res = ESP_FAIL; break; }
+    // Pace against an absolute deadline instead of sleeping a fixed frame time.
+    //
+    // delay(frameMs) assumed the send was free. It is not: measured over an
+    // 86-frame replay, sends cost 13516 ms (~157 ms/frame) on their own, so
+    // "100 ms per frame" became ~257 ms and an 11.8 s clip took ~30 s to watch
+    // -- while the progress bar, which is frame-based, raced ahead of the
+    // picture. Waiting only for the remainder keeps replay at the recorded
+    // frame rate, and skips the wait entirely when sending already ran long.
+    uint32_t due = startMs + (uint32_t)(frames * frameMs);
+    int32_t waitMs = (int32_t)(due - millis());
+    if (waitMs > 0) delay((uint32_t)waitMs);
   }
 
+  // Mark this replay finished before tearing down the socket, but ONLY if it
+  // is still the current replay. A superseded connection (a newer clip was
+  // selected mid-playback) must not clear the new clip's active flag — doing
+  // so made the freshly switched clip look instantly finished, so its time
+  // and duration never appeared on the progress bar.
+  if (myToken == gPlaybackToken) gPlaybackActive = false;
   httpd_resp_send_chunk(req, nullptr, 0);
   f.close();
   playbackClients_--;
+  free(frameBuf);
 
-  Serial.printf("[web] playback closed: %s (%lu frames in %lu ms)\n", path,
-                (unsigned long)frames, (unsigned long)(millis() - startMs));
+  Serial.printf("[web] playback closed: %s (%lu/%lu frames in %lu ms, stop=%s)\n",
+                path, (unsigned long)frames, (unsigned long)totalFrames,
+                (unsigned long)(millis() - startMs), stopReason);
+  Serial.printf("[web] playback timing: read=%lu ms send=%lu ms slowSends=%lu\n",
+                (unsigned long)dbgReadMs, (unsigned long)dbgSendMs,
+                (unsigned long)dbgSlowSends);
   return ESP_OK;
+}
+
+// Lightweight progress endpoint polled by the browser during a replay. Runs
+// on the main (port-80) server so it stays responsive while the port-81 task
+// is busy streaming frames. All state is published by handlePlayback.
+esp_err_t WebServer::handlePlaybackStatus(httpd_req_t* req) {
+  const uint32_t token = gPlaybackToken;
+  const bool active = gPlaybackActive;
+  const bool pending = gPlaybackPending;
+  const uint32_t done = gPlaybackFramesDone;
+  const uint32_t total = gPlaybackFramesTotal;
+  uint32_t duration = gPlaybackDurationMs;
+
+  // Report elapsed in MEDIA time, derived from frames delivered, not wall clock.
+  // The two diverge whenever the network is slower than the recorded frame
+  // rate (measured: an 11.8 s clip took ~30 s to transfer). Wall-clock elapsed
+  // then ran past duration and the label read like "00:25 / 00:11" while the
+  // bar, being frame-based, disagreed with it. Frame count drives both the bar
+  // and the label, so they can never contradict each other.
+  uint32_t elapsed;
+  if (total > 0 && duration > 0) {
+    elapsed = (uint32_t)((uint64_t)done * duration / total);
+  } else {
+    elapsed = millis() - gPlaybackStartMs;
+  }
+
+  // Prefer frame-based progress; it is exact even if the network stalls and
+  // the client buffers. Fall back to wall-clock when no frame count exists.
+  uint32_t progress = 0;
+  if (total > 0) {
+    progress = (uint32_t)((uint64_t)done * 100 / total);
+    if (progress > 100) progress = 100;
+  } else if (duration > 0) {
+    progress = elapsed * 100 / duration;
+    if (progress > 100) progress = 100;
+  }
+
+  char json[192];
+  snprintf(json, sizeof(json),
+           "{\"active\":%s,\"pending\":%s,\"token\":%lu,\"done\":%lu,\"total\":%lu,"
+           "\"progress\":%lu,\"elapsed_ms\":%lu,\"duration_ms\":%lu}",
+           active ? "true" : "false", pending ? "true" : "false",
+           (unsigned long)token,
+           (unsigned long)done, (unsigned long)total,
+           (unsigned long)progress, (unsigned long)elapsed,
+           (unsigned long)duration);
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+// Out-of-band cancellation, called by the browser (on port 80) right before it
+// switches clips or goes back to live. Port 81 runs all its URI handlers in a
+// single task and handlePlayback() holds that task for the whole clip, so just
+// aborting the old <img> socket is not enough: the new request would queue
+// behind the still-running old loop. Bumping the token here makes the old loop
+// see `token != gPlaybackToken` on its next frame and return, releasing port 81
+// for the new request. This handler never touches the stream task's other
+// state, so the new handler is free to publish a clean snapshot when it starts.
+esp_err_t WebServer::handlePlaybackCancel(httpd_req_t* req) {
+  // The device is the only authority that mints playback tokens, and it hands
+  // the new one back in the reply. The page must not invent its own: a
+  // page-local counter restarts at 0 on every reload while this device keeps
+  // counting, so a fresh page's tokens were always older than ours and
+  // handlePlayback() rejected every replay as superseded (409), which looked
+  // like playback breaking entirely after a few switches.
+  //
+  // Bumping here also serves the original purpose: an in-flight replay holding
+  // an older token sees the mismatch on its next frame, exits, and releases the
+  // single-task port 81 for the request that is about to arrive.
+  const uint32_t next = gPlaybackToken + 1;
+  gPlaybackToken = next;
+  gPlaybackActive = false;
+  gPlaybackPending = true;  // the clip that owns this token has not started
+
+  char json[48];
+  snprintf(json, sizeof(json), "{\"ok\":true,\"token\":%lu}",
+           (unsigned long)next);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }

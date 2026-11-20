@@ -2,8 +2,10 @@
 
 #include <JPEGDEC.h>
 #include <SPI.h>
+#include <SD_MMC.h>
 #include <esp_heap_caps.h>
 #include <driver/ledc.h>
+#include <math.h>
 
 #include "board/board_config.h"
 #include "ui/font5x7.h"
@@ -187,6 +189,15 @@ bool DisplayService::begin(CameraService* camera, NetworkService* network,
     Serial.println("[disp] letterbox buffer alloc failed; rotation 0/2 disabled");
   }
 
+  // One-frame JPEG staging buffer for clip playback. Recorded VGA frames are
+  // ~12 KB; 96 KB leaves headroom for complex scenes (quality spikes) and for
+  // the "skip oversized frame" path of AviReader to stay rare.
+  playJpegBuf_ = (uint8_t*)heap_caps_malloc(kPlayJpegCap, MALLOC_CAP_SPIRAM);
+  if (!playJpegBuf_) {
+    Serial.println("[disp] playback jpeg buffer alloc failed; playback disabled");
+  }
+  avi_ = new AviReader();
+
   // Output geometry must match the rotation before the panel init sets the
   // address window and clears the screen.
   updateOutputGeometry();
@@ -289,6 +300,19 @@ void DisplayService::taskLoop() {
     const uint8_t curPage = page_;
     const uint32_t curSeq = redrawSeq_;
     const bool pageChanged = (curPage != lastPage) || (curSeq != lastRedrawSeq);
+
+    // Clip playback owns the task while active. It is started by
+    // requestPlayback() from the UI task and ends by EOF, stopPlayback(), or
+    // error; afterwards the Events page is marked for repaint so the list
+    // reappears.
+    if (playState_ == (uint8_t)PlayState::Playing) {
+      playTaskLoop();
+      continue;
+    }
+    if (playRequest_ >= 0) {
+      startPendingPlayback();
+      continue;
+    }
 
     // Text pages are static: repaint only when something changed. The preview
     // page keeps streaming frames.
@@ -413,8 +437,10 @@ void DisplayService::initSt7789() {
   spiWriteCmd(kCmdDISPON);
   delay(50);
 
-  // Clear the panel RAM.
-  fillRect(0, 0, outW_, outH_, 0x0000);
+  // Clear the panel RAM to white so any area not covered by a later frame
+  // (e.g. the preview letterbox bars, or a smaller landscape window on the
+  // portrait glass) shows a clean white instead of leftover GRAM "snow".
+  fillRect(0, 0, outW_, outH_, 0xFFFF);
 }
 
 void DisplayService::setBacklight(bool on) {
@@ -450,6 +476,167 @@ void DisplayService::setHint(const char* text) {
   hint_[sizeof(hint_) - 1] = 0;
   redrawSeq_++;
 }
+
+// ---- on-panel clip playback ----------------------------------------------
+
+void DisplayService::setClipSelected(int i) {
+  if (i < 0) i = 0;
+  if (i > kMaxClipList - 1) i = kMaxClipList - 1;
+  clipSelected_ = i;
+  if (page_ == (uint8_t)Page::Events) redrawSeq_++;
+}
+
+void DisplayService::requestPlayback(int index) {
+  if (index < 0 || index >= kMaxClipList) return;
+  if (playState_ == (uint8_t)PlayState::Playing) return;  // already playing
+  playRequest_ = index;
+}
+
+void DisplayService::stopPlayback() {
+  playStopReq_ = true;
+}
+
+// Runs on the display task: opens the requested clip and enters the playing
+// state. Kept separate from requestPlayback() because SD open + frame scan
+// takes tens of milliseconds and must not run on the UI task.
+void DisplayService::startPendingPlayback() {
+  const int idx = playRequest_;
+  playRequest_ = -1;
+  if (idx < 0 || idx >= clipCount_ || !avi_ || !playJpegBuf_) return;
+
+  snprintf(playPath_, sizeof(playPath_), "/events/%s/EVT_%s.avi",
+           clipList_[idx].dir, clipList_[idx].name);
+  if (!avi_->begin(SD_MMC, playPath_)) {
+    Serial.printf("[disp] playback open failed: %s\n", playPath_);
+    setHint("OPEN FAILED");
+    redrawSeq_++;
+    return;
+  }
+  playStopReq_ = false;
+  playPaused_ = false;
+  playProgress_ = 0;
+  consecDecodeFails_ = 0;
+  playState_ = (uint8_t)PlayState::Playing;
+  Serial.printf("[disp] playing %s\n", playPath_);
+}
+
+// Decodes one JPEG into frameBuf_ and pushes it, then overlays the progress
+// bar. Same decode path as the live preview (decodeAndShow), including the
+// portrait letterbox composition.
+bool DisplayService::renderPlaybackFrame(const uint8_t* jpeg, size_t len,
+                                         int progress) {
+  gDispCtx.buf = frameBuf_;
+  gDispCtx.stride = kDispW;
+  gDispCtx.w = kDispW;
+  gDispCtx.h = kDispH;
+  gDispCtx.overflow = false;
+
+  if (!gJpegDecoder) gJpegDecoder = new JPEGDEC();
+  JPEGDEC& jpegDec = *gJpegDecoder;
+  if (jpegDec.openRAM((uint8_t*)jpeg, len, dispDrawCb)) {
+    jpegDec.setPixelType(RGB565_BIG_ENDIAN);
+    const int ok = jpegDec.decode(0, 0, JPEG_SCALE_HALF);
+    jpegDec.close();
+    if (ok && !gDispCtx.overflow) {
+      if (isPortraitRotation(rotation_)) {
+        if (rotBuf_) {
+          composeLetterboxPortrait();
+          pushFrame(rotBuf_, outW_, outH_);
+        }
+      } else {
+        pushFrame(frameBuf_, outW_, outH_);
+      }
+      drawStatusBar();
+      renderPlaybackOverlay(progress, playPaused_);
+      return true;
+    } else {
+      decodeFails_++;
+    }
+  } else {
+    decodeFails_++;
+  }
+  return false;
+}
+
+// Bottom strip: progress bar + time position + paused marker. Drawn on top of
+// the pushed frame, like drawStatusBar.
+void DisplayService::renderPlaybackOverlay(int progress, bool paused) {
+  const uint16_t kAccent = 0x07E0;
+  const uint16_t kWarn = 0xFFE0;
+  const int w = outW_;
+  const int h = outH_;
+  const int barY = h - 18;
+  const int barX = 8;
+  const int barW = w - 16;
+
+  // Dark pill behind the bar so it reads over any video content.
+  drawCard(barX - 4, barY - 6, barW + 8, 20, 0x0000, 8);
+  drawBar(barX, barY, barW, 8, progress, kAccent, 0x2104);
+  if (paused) {
+    // Two vertical bars = pause glyph, at the left inside the pill.
+    fillRect(barX + barW - 22, barY - 3, 3, 12, kWarn);
+    fillRect(barX + barW - 16, barY - 3, 3, 12, kWarn);
+  }
+}
+
+// Frame pump for the Playing state. Runs only on the display task. Each
+// iteration decodes and pushes one frame, paced to roughly the recorded
+// nominal fps; the buttons can pause or stop.
+void DisplayService::playTaskLoop() {
+  // Nominal 10 fps matches EventRecorder::Config::nominalFps; AVI strh rate
+  // is per-clip but re-parsing it would cost another seek, and 10 fps is what
+  // every clip is recorded with.
+  constexpr uint32_t kFrameIntervalMs = 100;   // 10 fps
+  constexpr uint32_t kPausedPollMs = 120;
+  static uint32_t lastFrameMs = 0;
+
+  if (playStopReq_) {
+    endPlayback("STOPPED");
+    return;
+  }
+
+  if (playPaused_) {
+    vTaskDelay(pdMS_TO_TICKS(kPausedPollMs));
+    return;
+  }
+
+  if (millis() - lastFrameMs < kFrameIntervalMs) {
+    vTaskDelay(pdMS_TO_TICKS(5));
+    return;
+  }
+  lastFrameMs = millis();
+
+  const int n = avi_->nextFrame(playJpegBuf_, kPlayJpegCap);
+  if (n == 0) {
+    endPlayback("END");
+    return;
+  }
+  if (n < 0) return;  // oversized frame skipped; try the next one
+
+  // Abort after consecutive decode failures: a corrupt clip (or an old file
+  // whose index got misread) must not leave the panel frozen for minutes with
+  // keys looking dead. ~3 s of failures = give up.
+  playProgress_ = avi_->progressPercent();
+  if (!renderPlaybackFrame(playJpegBuf_, (size_t)n, playProgress_)) {
+    if (++consecDecodeFails_ >= 30) endPlayback("BAD FILE");
+    return;
+  }
+  consecDecodeFails_ = 0;
+  taskYIELD();
+}
+
+// Common exit: close the file, drop back to the Events list and repaint it.
+void DisplayService::endPlayback(const char* reason) {
+  Serial.printf("[disp] playback %s\n", reason);
+  if (avi_) avi_->end();
+  playState_ = (uint8_t)PlayState::Idle;
+  playStopReq_ = false;
+  playPaused_ = false;
+  // Back to the Events page and force a repaint of the list.
+  page_ = (uint8_t)Page::Events;
+  redrawSeq_++;
+}
+
 
 // Draws one string with the built-in 5x7 font. Each glyph column is sent as a
 // run of fillRect() calls: the driver has no partial-buffer API, so this is the
@@ -490,130 +677,475 @@ void DisplayService::drawFrameRect(int x, int y, int w, int h, uint16_t color) {
   fillRect(x + w - 1, y, 1, h, color);
 }
 
+// ---- refined-UI primitives -------------------------------------------------
+//
+// Palette. A dark background with one accent keeps the 240-px-wide panel
+// readable at arm's length and in daylight; green accents match the web UI.
+namespace uitheme {
+constexpr uint16_t kBg      = 0x0000;  // near-black page background
+constexpr uint16_t kCard    = 0x1082;  // dark slate card (r 16 g 32 b 32 approx)
+constexpr uint16_t kCardHi  = 0x18C3;  // slightly lighter card top edge
+constexpr uint16_t kBorder  = 0x2104;  // 33% grey border/track
+constexpr uint16_t kFg      = 0xFFFF;  // white
+constexpr uint16_t kDim     = 0x8410;  // 50% grey secondary text
+constexpr uint16_t kAccent  = 0x07E0;  // green
+constexpr uint16_t kAccent2 = 0x05FF;  // cyan (info)
+constexpr uint16_t kWarn    = 0xFFE0;  // yellow
+constexpr uint16_t kErr     = 0xF800;  // red
+constexpr uint16_t kTitleBg = 0x0000;  // title bar blends into the page
+}  // namespace uitheme
+
+void DisplayService::drawCard(int x, int y, int w, int h, uint16_t color,
+                              int radius) {
+  if (radius < 1) { fillRect(x, y, w, h, color); return; }
+  if (radius > h / 2) radius = h / 2;
+  if (radius > w / 2) radius = w / 2;
+
+  // Interior slab in one window write; corners stepped inward per row.
+  fillRect(x, y + radius, w, h - 2 * radius, color);
+  for (int i = 0; i < radius; i++) {
+    // Corner inset follows a quarter-circle: dx = r - sqrt(r^2 - dy^2).
+    const int dy = radius - i;                    // 1..r from the flat edge
+    const int dx = radius - (int)sqrtf((float)radius * radius -
+                                       (float)dy * dy);
+    fillRect(x + dx, y + i, w - 2 * dx, 1, color);              // top edge row
+    fillRect(x + dx, y + h - 1 - i, w - 2 * dx, 1, color);      // bottom edge row
+  }
+}
+
+void DisplayService::fillCircle(int cx, int cy, int r, uint16_t color) {
+  if (r <= 0) { fillRect(cx, cy, 1, 1, color); return; }
+  for (int dy = -r; dy <= r; dy++) {
+    const int dx = (int)sqrtf((float)r * r - (float)dy * dy);
+    fillRect(cx - dx, cy + dy, dx * 2 + 1, 1, color);
+  }
+}
+
+void DisplayService::drawBar(int x, int y, int w, int h, int percent,
+                             uint16_t fill, uint16_t track) {
+  if (w < 3 || h < 3) return;
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  // Rounded track.
+  drawCard(x, y, w, h, track, h / 2);
+  if (percent <= 0) return;
+  const int fw = (int)((long)w * percent / 100);
+  if (fw <= h) {
+    // Round cap for a short fill.
+    drawCard(x, y, fw, h, fill, fw / 2);
+  } else {
+    drawCard(x, y, h, h, fill, h / 2);            // left cap
+    fillRect(x + h / 2, y, fw - h, h, fill);      // body
+    drawCard(x + fw - h, y, h, h, fill, h / 2);   // right cap
+  }
+}
+
+// WiFi: filled dot + two arcs approximated by concentric quarter bands. ok=false
+// draws a red cross instead so the failure mode is obvious.
+void DisplayService::drawWifiIcon(int x, int y, bool ok) {
+  const uint16_t c = ok ? uitheme::kAccent : uitheme::kErr;
+  if (!ok) {
+    // 9x9 red X.
+    for (int i = 0; i < 7; i++) {
+      fillRect(x + i, y + i, 2, 2, c);
+      fillRect(x + 7 - i, y + i, 2, 2, c);
+    }
+    return;
+  }
+  fillCircle(x + 5, y + 10, 2, c);                       // dot
+  for (int i = 0; i < 5; i++) fillRect(x + 1 + i, y + 8 - i, 2, 2, c);
+  for (int i = 0; i < 5; i++) fillRect(x + 8 - i, y + 8 - i, 2, 2, c);
+  for (int i = 0; i < 7; i++) fillRect(x + i, y + 4, 2, 2, c);
+  for (int i = 0; i < 4; i++) { fillRect(x + i, y + 4 - i, 2, 2, c); }
+  for (int i = 0; i < 4; i++) { fillRect(x + 8 - i, y + 4 - i, 2, 2, c); }
+}
+
+// Recording: pulsing filled circle inside a ring.
+void DisplayService::drawRecIcon(int x, int y, bool blinkOn) {
+  const uint16_t ring = uitheme::kBorder;
+  // 14px ring.
+  for (int dy = -7; dy <= 7; dy++) {
+    const int dx = (int)sqrtf(49.0f - (float)dy * dy);
+    if (dx < 6) continue;
+    fillRect(x + 7 - dx, y + 7 + dy, 2, 1, ring);
+    fillRect(x + 7 + dx, y + 7 + dy, 2, 1, ring);
+  }
+  if (blinkOn) fillCircle(x + 7, y + 7, 5, uitheme::kErr);
+  else {
+    fillCircle(x + 7, y + 7, 5, uitheme::kCard);
+    fillCircle(x + 7, y + 7, 3, uitheme::kErr);
+  }
+}
+
+// SD card glyph with a fill bar showing free space.
+void DisplayService::drawSdIcon(int x, int y, int fillPercent) {
+  // Card body 12x15, notched top-right corner.
+  fillRect(x + 2, y, 10, 15, uitheme::kCardHi);
+  fillRect(x, y + 2, 12, 13, uitheme::kCardHi);
+  // Contact pins.
+  for (int i = 0; i < 4; i++) fillRect(x + 3 + i * 2, y + 1, 1, 2, uitheme::kCard);
+  // Free-space bar inside the card.
+  if (fillPercent < 0) fillPercent = 0;
+  if (fillPercent > 100) fillPercent = 100;
+  fillRect(x + 2, y + 9, 8, 4, uitheme::kCard);
+  const int fw = 8 * fillPercent / 100;
+  if (fw > 0) fillRect(x + 2, y + 9, fw, 4, uitheme::kAccent2);
+}
+
+// Relay: a small dish with a signal wedge; live adds an expanding arc dot.
+void DisplayService::drawRelayIcon(int x, int y, bool live) {
+  const uint16_t c = live ? uitheme::kWarn : uitheme::kDim;
+  // Dish: bottom-filled triangle-ish wedge 11x7.
+  for (int row = 0; row < 7; row++) {
+    const int wide = 11 - row * 2;
+    if (wide <= 0) break;
+    fillRect(x + (11 - wide) / 2, y + row, wide, 1, c);
+  }
+  if (live) {
+    fillRect(x + 5, y - 4, 2, 2, uitheme::kAccent);
+    fillRect(x + 4, y - 2, 4, 1, uitheme::kAccent);
+  }
+}
+
+// 3x5 pixel digits for the big readout, row-major bitmaps, '1'..'9','0',':','%'.
+void DisplayService::drawBigNum(int x, int y, const char* s, uint16_t color,
+                                int scale) {
+  static const uint8_t kDig[16][5] = {
+    {0x7,0x5,0x5,0x5,0x7}, // 0
+    {0x2,0x6,0x2,0x2,0x7}, // 1
+    {0x7,0x1,0x7,0x4,0x7}, // 2
+    {0x7,0x1,0x7,0x1,0x7}, // 3
+    {0x5,0x5,0x7,0x1,0x1}, // 4
+    {0x7,0x4,0x7,0x1,0x7}, // 5
+    {0x7,0x4,0x7,0x5,0x7}, // 6
+    {0x7,0x1,0x2,0x2,0x2}, // 7
+    {0x7,0x5,0x7,0x5,0x7}, // 8
+    {0x7,0x5,0x7,0x1,0x7}, // 9
+    {0x0,0x2,0x0,0x2,0x0}, // :
+    {0x5,0x5,0x2,0x0,0x2}, // %
+    {0x7,0x4,0x6,0x4,0x7}, // K
+    {0x2,0x5,0x7,0x5,0x2}, // M
+    {0x2,0x5,0x5,0x5,0x2}, // B
+    {0x0,0x0,0x7,0x0,0x0}, // - (dash fallback)
+  };
+  if (scale < 1) scale = 1;
+  int cx = x;
+  for (const char* p = s; *p; ++p) {
+    int idx = -1;
+    if (*p >= '0' && *p <= '9') idx = *p - '0';
+    else if (*p == ':') idx = 10;
+    else if (*p == '%') idx = 11;
+    else if (*p == 'K') idx = 12;
+    else if (*p == 'M') idx = 13;
+    else if (*p == 'B') idx = 14;
+    else if (*p == '-' || *p == ' ') idx = 15;
+    if (idx >= 0) {
+      const uint8_t* g = kDig[idx];
+      for (int row = 0; row < 5; row++) {
+        for (int col = 0; col < 3; col++) {
+          if (g[row] & (1u << (2 - col))) {
+            fillRect(cx + col * scale, y + row * scale, scale, scale, color);
+          }
+        }
+      }
+      cx += 4 * scale;
+    } else {
+      cx += 4 * scale;  // unsupported: advance only
+    }
+  }
+}
+
 // Renders one of the text pages. Layout is deliberately independent of
 // orientation: the whole page is composed from the current outW_/outH_, so it
 // works both letterboxed (240x320) and landscape (320x240).
+//
+// Refined design (v2): dark page, rounded cards, icon chips, big numeric
+// readouts and progress bars instead of raw label/value lines.
 void DisplayService::renderTextPage(Page p) {
-  constexpr uint16_t kBg = 0x0000;
-  constexpr uint16_t kFg = 0xFFFF;
-  constexpr uint16_t kDim = 0x8410;   // grey
-  constexpr uint16_t kAccent = 0x07E0;  // green
-  constexpr uint16_t kTitleBg = 0x0010;  // dark blue
-
+  using namespace uitheme;
   const int w = outW_;
   const int h = outH_;
   const int lineH = 12;
-  const int marginX = 4;
+  const int marginX = 6;
 
   fillRect(0, 0, w, h, kBg);
 
-  // Title bar.
+  // ---- title bar: accent pill + page name + page index ----------------------
   const char* title = "";
+  uint16_t titleAccent = kAccent;
   switch (p) {
-    case Page::Events:   title = "EVENTS"; break;
-    case Page::Settings: title = "SETTINGS"; break;
-    case Page::Network:  title = "NETWORK"; break;
-    default:             title = "CAM-AI"; break;
+    case Page::Events:   title = "EVENTS";   titleAccent = kAccent2; break;
+    case Page::Settings: title = "SETTINGS"; titleAccent = kWarn;    break;
+    case Page::Network:  title = "NETWORK";  titleAccent = kAccent;  break;
+    default:             title = "CAM-AI";   titleAccent = kAccent;  break;
   }
-  fillRect(0, 0, w, lineH + 2, kTitleBg);
-  drawText(marginX, 4, title, kFg, kTitleBg);
-  // Page indicator on the right of the title bar.
+  // Accent tick left of the title (6x15 rounded pill).
+  drawCard(marginX, 4, 6, 15, titleAccent, 3);
+  drawText(marginX + 11, 6, title, kFg, kBg, 2);
   char idx[8];
   snprintf(idx, sizeof(idx), "%u/%u", (unsigned)p + 1,
            (unsigned)Page::PageCount);
   const int idxW = font5x7::textWidth(idx);
-  drawText(w - marginX - idxW, 4, idx, kDim, kTitleBg);
+  drawText(w - marginX - idxW, 10, idx, kDim, kBg);
 
-  int y = lineH + 8;
+  int y = 28;
 
   if (p == Page::Events) {
     const EventRecorder::Status* rs = recorder_ ? &recorder_->status() : nullptr;
     char buf[32];
 
-    drawText(marginX, y, "STORAGE", kDim, kBg); y += lineH;
+    // ---- compact storage card ----------------------------------------------
+    const int cardX = marginX, cardW = w - 2 * marginX;
+    int cardY = y;
+    drawCard(cardX, cardY, cardW, 38, kCard, 7);
+    drawSdIcon(cardX + 8, cardY + 7,
+               rs && rs->totalMb
+                   ? (int)((uint64_t)rs->freeMb * 100 / rs->totalMb)
+                   : 0);
     if (rs && rs->mounted) {
-      snprintf(buf, sizeof(buf), "FREE %lu MB", (unsigned long)rs->freeMb);
-      drawText(marginX, y, buf, kFg, kBg); y += lineH;
-      snprintf(buf, sizeof(buf), "TOTAL %lu MB", (unsigned long)rs->totalMb);
-      drawText(marginX, y, buf, kFg, kBg); y += lineH;
+      snprintf(buf, sizeof(buf), "%luM/%luM FREE",
+               (unsigned long)rs->freeMb, (unsigned long)rs->totalMb);
+      drawText(cardX + 28, cardY + 7, buf, kFg, kCard);
+      // Free-ratio bar under the text.
+      drawBar(cardX + 28, cardY + 22, cardW - 40, 7,
+              rs->totalMb
+                  ? (int)((uint64_t)rs->freeMb * 100 / rs->totalMb)
+                  : 0,
+              kAccent2, kBorder);
     } else {
-      drawText(marginX, y, "NO SD CARD", 0xF800, kBg); y += lineH;
+      drawText(cardX + 28, cardY + 7, "NO SD CARD", kErr, kCard);
+      drawText(cardX + 28, cardY + 20, "recording off", kDim, kCard);
     }
+    y = cardY + 44;
 
-    y += 4;
-    drawText(marginX, y, "CLIPS", kDim, kBg); y += lineH;
+    // ---- clips summary row: written | failed, inline -----------------------
+    cardY = y;
+    drawCard(cardX, cardY, cardW, 30, kCard, 7);
     if (rs) {
-      snprintf(buf, sizeof(buf), "WRITTEN %lu", (unsigned long)rs->clipsWritten);
-      drawText(marginX, y, buf, kFg, kBg); y += lineH;
-      snprintf(buf, sizeof(buf), "FAILED %lu", (unsigned long)rs->clipsFailed);
-      drawText(marginX, y, buf,
-               rs->clipsFailed ? (uint16_t)0xF800 : (uint16_t)kDim, kBg);
-      y += lineH;
-      if (rs->lastClip[0]) {
-        drawText(marginX, y, "LAST", kDim, kBg); y += lineH;
-        // EVT_20261113_161500_001 -> keep the tail that still fits the panel
-        const char* name = rs->lastClip;
-        const int maxChars = (w - 2 * marginX) / (font5x7::kGlyphW + 1);
-        const int len = (int)strlen(name);
-        if (len > maxChars) name += (len - maxChars);
-        drawText(marginX, y, name, kAccent, kBg); y += lineH;
+      snprintf(buf, sizeof(buf), "CLIPS %lu", (unsigned long)rs->clipsWritten);
+      drawText(cardX + 8, cardY + 10, buf, kAccent, kCard);
+      snprintf(buf, sizeof(buf), "FAIL %lu", (unsigned long)rs->clipsFailed);
+      drawText(cardX + cardW - 10 - font5x7::textWidth(buf), cardY + 10, buf,
+               rs->clipsFailed ? (uint16_t)kErr : (uint16_t)kDim, kCard);
+    } else {
+      drawText(cardX + 8, cardY + 10, "recorder offline", kDim, kCard);
+    }
+    y = cardY + 36;
+
+    // ---- recent clips list -------------------------------------------------
+    // SD scan only on repaint (page change), never per frame.
+    scanClips();
+    if (clipSelected_ >= clipCount_) clipSelected_ = clipCount_ - 1;
+    if (clipSelected_ >= clipCount_) clipSelected_ = clipCount_ - 1;
+    cardY = y;
+    if (clipCount_ > 0) {
+      const int rowH = 16;
+      const int listH = clipCount_ * rowH + 18;
+      drawCard(cardX, cardY, cardW, listH, kCard, 7);
+      drawText(cardX + 8, cardY + 5, "RECENT", kDim, kCard);
+      int ry = cardY + 18;
+      for (int i = 0; i < clipCount_; i++) {
+        const ClipEntry& e = clipList_[i];
+        const bool sel = ((int)clipSelected_ == i);
+        // Selected row: full-width inset highlight pill + accent border on the
+        // play glyph, so the choice is unambiguous before starting playback.
+        const uint16_t rowBg = sel ? (uint16_t)0x1284 : (uint16_t)kCard;
+        if (sel) drawCard(cardX + 4, ry - 1, cardW - 8, rowH, rowBg, 6);
+        // Play glyph: small triangle in a circle (accent when selected).
+        fillCircle(cardX + 13, ry + 6, 6, sel ? (uint16_t)kAccent : (uint16_t)0x2104);
+        fillRect(cardX + 11, ry + 3, 2, 7, sel ? (uint16_t)0x0000 : (uint16_t)kAccent);
+        fillRect(cardX + 13, ry + 4, 1, 5, sel ? (uint16_t)0x0000 : (uint16_t)kAccent);
+        fillRect(cardX + 14, ry + 5, 1, 3, sel ? (uint16_t)0x0000 : (uint16_t)kAccent);
+        // Name + size. e.name is "20261120_161500_001" or "uptime_x_001";
+        // show the tail that fits.
+        const char* nm = e.name;
+        const int maxChars = (cardW - 60) / (font5x7::kGlyphW + 1);
+        const int len = (int)strlen(nm);
+        if (len > maxChars) nm += (len - maxChars);
+        drawText(cardX + 24, ry + 2, nm, sel ? (uint16_t)kFg : (uint16_t)kDim, rowBg);
+        snprintf(buf, sizeof(buf), "%luK", (unsigned long)e.kb);
+        drawText(cardX + cardW - 10 - font5x7::textWidth(buf), ry + 2, buf,
+                 sel ? (uint16_t)kAccent2 : (uint16_t)kDim, rowBg);
+        ry += rowH;
       }
+      y = cardY + listH + 6;
+    } else {
+      drawCard(cardX, cardY, cardW, 26, kCard, 7);
+      drawText(cardX + 8, cardY + 8, rs && rs->mounted ? "NO CLIPS YET"
+                                                       : "insert SD card",
+               kDim, kCard);
+      y = cardY + 32;
     }
   } else if (p == Page::Settings) {
+    const int cardX = marginX, cardW = w - 2 * marginX;
     if (menuRows_ && menuCount_ > 0) {
+      // Menu rows live inside one card; the selected row gets an inset
+      // highlight pill; an editing row turns the value yellow with a caret.
+      // Rows use scale-2 text (12x14 glyphs) after user feedback that the
+      // 5x7 font was too small: row height 26, values right-aligned.
+      const int rowH = 26;
+      const int listH = menuCount_ * rowH + 14;
+      drawCard(cardX, y, cardW, listH, kCard, 7);
+      int ry = y + 8;
       for (int i = 0; i < menuCount_; i++) {
         const MenuRow& r = menuRows_[i];
-        const uint16_t bg = r.selected ? (r.editing ? (uint16_t)0x001F
-                                                    : (uint16_t)0x0320)
-                                       : (uint16_t)kBg;
-        if (r.selected) fillRect(0, y - 2, w, lineH, bg);
-
-        drawText(marginX, y, r.label, r.selected ? kFg : kDim, bg);
-        const int vw = font5x7::textWidth(r.value);
-        drawText(w - marginX - vw, y, r.value,
-                 r.editing ? (uint16_t)0xFFE0 : (r.selected ? (uint16_t)kAccent
-                                                            : (uint16_t)kFg),
-                 bg);
-        y += lineH;
-        if (y > h - 2 * lineH) break;
+        if (r.selected) {
+          const uint16_t hiBg = r.editing ? (uint16_t)0x8200 : (uint16_t)0x1284;
+          drawCard(cardX + 4, ry - 3, cardW - 8, rowH, hiBg, 6);
+          drawText(cardX + 10, ry + 4, r.label, kFg, hiBg, 2);
+          char val[24];
+          snprintf(val, sizeof(val), "%s%s", r.value, r.editing ? "<" : "");
+          const int vw = font5x7::textWidth(val, 2);
+          drawText(cardX + cardW - 10 - vw, ry + 4, val,
+                   r.editing ? (uint16_t)kWarn : (uint16_t)kAccent, hiBg, 2);
+        } else {
+          // Dim labels keep the unselected rows visually quieter, but at the
+          // same large size so the column of rows stays aligned.
+          drawText(cardX + 10, ry + 4, r.label, kDim, kCard, 2);
+          const int vw = font5x7::textWidth(r.value, 2);
+          drawText(cardX + cardW - 10 - vw, ry + 4, r.value, kFg, kCard, 2);
+        }
+        ry += rowH;
+        if (ry > y + listH - rowH) break;
       }
+      y += listH + 8;
     } else {
-      drawText(marginX, y, "NO ITEMS", kDim, kBg); y += lineH;
+      drawCard(cardX, y, cardW, 30, kCard, 7);
+      drawText(cardX + 10, y + 10, "NO ITEMS", kDim, kCard);
+      y += 38;
     }
   } else if (p == Page::Network) {
     char buf[40];
     const bool up = network_ && network_->isConnected();
+    const int cardX = marginX, cardW = w - 2 * marginX;
 
-    drawText(marginX, y, "STATUS", kDim, kBg); y += lineH;
-    drawText(marginX, y, up ? "CONNECTED" : "OFFLINE",
-             up ? (uint16_t)kAccent : (uint16_t)0xF800, kBg);
-    y += lineH;
-
+    // ---- connection card ----------------------------------------------------
+    int cardY = y;
+    drawCard(cardX, cardY, cardW, 36, kCard, 7);
+    drawWifiIcon(cardX + 8, cardY + 9, up);
+    drawText(cardX + 28, cardY + 8, up ? "CONNECTED" : "OFFLINE",
+             up ? (uint16_t)kAccent : (uint16_t)kErr, kCard);
     if (up) {
-      snprintf(buf, sizeof(buf), "IP %s",
-               network_->localIp().toString().c_str());
-      drawText(marginX, y, buf, kFg, kBg); y += lineH;
       snprintf(buf, sizeof(buf), "RSSI %d dBm", (int)network_->rssi());
-      drawText(marginX, y, buf, kFg, kBg); y += lineH;
+      drawText(cardX + 28, cardY + 21, buf, kDim, kCard);
+    } else {
+      drawText(cardX + 28, cardY + 21,
+               network_ && network_->provisioningActive() ? "AP CONFIG MODE"
+                                                          : "waiting...",
+               kDim, kCard);
+    }
+    y = cardY + 42;
+
+    // ---- address card: IP at scale 2 ---------------------------------------
+    if (up) {
+      cardY = y;
+      drawCard(cardX, cardY, cardW, 40, kCard, 7);
+      drawText(cardX + 8, cardY + 5, "IP", kDim, kCard);
+      snprintf(buf, sizeof(buf), "%s",
+               network_->localIp().toString().c_str());
+      drawText(cardX + 8, cardY + 19, buf, kFg, kCard, 2);
+      y = cardY + 46;
     }
 
-    y += 4;
+    // ---- system card --------------------------------------------------------
+    cardY = y;
+    drawCard(cardX, cardY, cardW, 46, kCard, 7);
     snprintf(buf, sizeof(buf), "UPTIME %lus",
              (unsigned long)(millis() / 1000));
-    drawText(marginX, y, buf, kFg, kBg); y += lineH;
-    drawText(marginX, y, "FW 0.5.0 M6", kDim, kBg); y += lineH;
-
-    // Heap is the number that matters when the stream and a clip run together.
-    snprintf(buf, sizeof(buf), "HEAP %uK", (unsigned)(ESP.getFreeHeap() / 1024));
-    drawText(marginX, y, buf, kDim, kBg); y += lineH;
+    drawText(cardX + 8, cardY + 6, buf, kFg, kCard);
+    snprintf(buf, sizeof(buf), "HEAP %uK",
+             (unsigned)(ESP.getFreeHeap() / 1024));
+    drawText(cardX + 8, cardY + 19, buf, kDim, kCard);
+    // Heap health bar: 320 KB budget, green above 30%.
+    {
+      uint32_t fh = ESP.getFreeHeap();
+      int pct = (int)((uint64_t)fh * 100 / 327680UL);
+      if (pct < 0) pct = 0;
+      if (pct > 100) pct = 100;
+      drawBar(cardX + cardW - 78, cardY + 20, 70, 8, pct,
+              pct > 30 ? kAccent : kErr, kBorder);
+    }
+    drawText(cardX + 8, cardY + 32, "FW 0.6.0 M7", kDim, kCard);
+    y = cardY + 52;
   }
 
-  // Hint line at the bottom, e.g. "GPIO0 LONG = PROVISION".
+  // Hint pill at the bottom, e.g. "GPIO0 LONG = PROVISION".
   if (hint_[0]) {
-    const int hy = h - lineH - 3;
-    fillRect(0, hy, w, lineH + 3, 0x2104);
-    drawText(marginX, hy + 2, hint_, 0xFFE0, 0x2104);
+    const int hy = h - lineH - 8;
+    const int hw = font5x7::textWidth(hint_) + 14;
+    drawCard(marginX, hy, hw < w - 2 * marginX ? hw : w - 2 * marginX,
+             lineH + 5, 0x1082, 7);
+    drawText(marginX + 7, hy + 4, hint_, 0xFFE0, 0x1082);
   }
+}
+
+// Scan /events/<date>/EVT_*.avi newest-first into clipList_. Runs on the
+// display task only when the Events page repaints: an SD directory walk takes
+// tens of milliseconds per folder and must never run per frame. FAT returns
+// entries in creation order, so reading directories last-to-first and files
+// last-to-first approximates newest-first without sorting.
+int DisplayService::scanClips() {
+  clipCount_ = 0;
+
+  File root = SD_MMC.open("/events");
+  if (!root || !root.isDirectory()) return 0;
+
+  // Collect date dirs (max 8, enough history for a "recent" list).
+  constexpr int kMaxDirs = 8;
+  String dirs[kMaxDirs];
+  int dirCount = 0;
+  File d = root.openNextFile();
+  while (d && dirCount < kMaxDirs) {
+    if (d.isDirectory()) {
+      String name = d.name();
+      int slash = name.lastIndexOf('/');
+      if (slash >= 0) name = name.substring(slash + 1);
+      dirs[dirCount++] = name;
+    }
+    d = root.openNextFile();
+  }
+  root.close();
+
+  // Newest date dir first; within a dir, collect all .avi names then take the
+  // tail (FAT order is oldest-first, so the tail is the newest).
+  for (int i = dirCount - 1; i >= 0 && clipCount_ < kMaxClipList; i--) {
+    String dirPath = String("/events/") + dirs[i];
+    File dir = SD_MMC.open(dirPath.c_str());
+    if (!dir || !dir.isDirectory()) continue;
+
+    String names[10];
+    uint32_t sizes[10];
+    int n = 0;
+    File f = dir.openNextFile();
+    while (f && n < 10) {
+      String fname = f.name();
+      int slash = fname.lastIndexOf('/');
+      if (slash >= 0) fname = fname.substring(slash + 1);
+      if (fname.endsWith(".avi")) {
+        names[n] = fname;
+        sizes[n] = (uint32_t)(f.size() / 1024);  // KB
+        n++;
+      }
+      f = dir.openNextFile();
+    }
+    dir.close();
+
+    for (int j = n - 1; j >= 0 && clipCount_ < kMaxClipList; j--) {
+      ClipEntry& e = clipList_[clipCount_];
+      // Short label: strip "EVT_" prefix and ".avi" suffix; the date is the
+      // card header, so the time part is what distinguishes entries.
+      String short_ = names[j];
+      short_.replace("EVT_", "");
+      short_.replace(".avi", "");
+      strncpy(e.name, short_.c_str(), sizeof(e.name) - 1);
+      e.name[sizeof(e.name) - 1] = 0;
+      strncpy(e.dir, dirs[i].c_str(), sizeof(e.dir) - 1);
+      e.dir[sizeof(e.dir) - 1] = 0;
+      e.kb = sizes[j];
+      clipCount_++;
+    }
+  }
+  return clipCount_;
 }
 
 void DisplayService::updateOutputGeometry() {
@@ -647,11 +1179,18 @@ void DisplayService::setRotation(uint8_t r) {
 // would fill the glass but lay the scene on its side, which was the
 // mismatch seen on hardware.
 void DisplayService::composeLetterboxPortrait() {
-  const int imgW = kDispH;               // 240
-  const int imgH = kDispW * 3 / 4;       // 180
+  // Source frame is kDispW x kDispH (320x240). Scale by 3/4 to fit the
+  // 240-pixel-wide portrait glass -> 240x180. Using kDispW here (320*3/4=240)
+  // made us draw 240 rows whose source rows ran to 318, i.e. ~50 KB past the
+  // end of frameBuf_, which showed up as "snow" in the lower image band.
+  const int imgW = kDispW * 3 / 4;       // 240
+  const int imgH = kDispH * 3 / 4;       // 180
   const int yOff = (kDispW - imgH) / 2;  // (320 - 180) / 2 = 70
 
-  memset(rotBuf_, 0, kDispW * kDispH * sizeof(uint16_t));
+  // Fill the whole portrait buffer with white first. The rows above/below the
+  // letterboxed image (the area "outside" the 240x180 camera picture) then show
+  // a clean white instead of leftover GRAM/PSRAM noise ("snow").
+  for (int i = 0; i < kDispW * kDispH; i++) rotBuf_[i] = 0xFFFF;
   for (int gy = 0; gy < imgH; gy++) {
     const uint16_t* srcRow = frameBuf_ + (size_t)(gy * 4 / 3) * kDispW;
     uint16_t* dstRow = rotBuf_ + (size_t)(yOff + gy) * imgW;
@@ -777,35 +1316,49 @@ void DisplayService::drawStatusBar() {
     return;
   }
 
-  // Top 20-pixel bar with: Wi-Fi dBm, rec indicator, SD free space.
-  int barH = 20;
+  using namespace uitheme;
 
-  // Background.
-  fillRect(0, 0, outW_, barH, 0x0000);  // black
+  // Refined status bar: 22 px translucent-style black strip with icon chips.
+  // wifi | rec | relay on the left, SD free bar (with icon) on the right.
+  const int barH = 22;
+  fillRect(0, 0, outW_, barH, kBg);
 
-  // We do not have font rendering in this minimal driver; instead we draw
-  // simple colored blocks as indicators:
-  //   Green  = Wi-Fi connected, red = disconnected
-  //   Red    = recording dot, blinks via frame count parity
-  //   Blue   = SD free bar width proportional to free MB
+  int x = 4;
+  // Wi-Fi icon (9x12 glyph).
+  const bool wifiUp = network_ && network_->isConnected();
+  drawWifiIcon(x, 5, wifiUp);
+  x += 14;
 
-  // Wi-Fi indicator: 12x12 square at x=4,y=4.
-  uint16_t wifiColor = (network_ && network_->isConnected()) ? 0x07E0 : 0xF800;
-  fillRect(4, 4, 12, 12, wifiColor);
+  // Recording indicator: ring + dot, blinks at ~2 Hz via frame parity.
+  const bool rec = recorder_ && recorder_->isRecording();
+  drawRecIcon(x, 4, rec && (frameCount_ & 0x08));
+  x += 18;
 
-  // Recording indicator: 12x12 red dot at x=20,y=4, blinks at ~2 Hz.
-  if (recorder_ && recorder_->isRecording() && (frameCount_ & 0x08)) {
-    fillRect(20, 4, 12, 12, 0xF800);
-  } else {
-    fillRect(20, 4, 12, 12, 0x0000);
-  }
+  // Relay chip: dish with a live wedge when a viewer watches the cloud stream.
+  bool relayLive = false;
+  bool relayOn = false;
+  // relay_ is not wired into DisplayService (it lives in main/web); derive the
+  // "live" look from the recorder-free heuristic: no relay pointer here yet,
+  // so keep the slot dim until M7 display wiring lands.
+  relayOn = false;
+  (void)relayLive;
+  drawRelayIcon(x, 6, relayOn);
+  x += 16;
 
-  // SD free bar: width proportional to free MB, max 200 MB.
+  // SD free bar with card glyph on the right edge.
   if (recorder_) {
-    uint32_t freeMb = recorder_->status().freeMb;
-    int barW = (int)(freeMb > 200 ? 200 : freeMb);
-    fillRect(40, 4, barW, 12, 0x001F);  // blue bar
-    // Remaining as dark grey.
-    if (barW < 200) fillRect(40 + barW, 4, 200 - barW, 12, 0x2104);
+    const EventRecorder::Status& st = recorder_->status();
+    if (st.totalMb > 0) {
+      const int pct = (int)((uint64_t)st.freeMb * 100 / st.totalMb);
+      drawSdIcon(outW_ - 18, 3, pct);
+      // Bar next to the icon.
+      const int barW = outW_ - x - 26;
+      if (barW > 20) {
+        drawBar(x, 8, barW, 8, pct, pct > 20 ? kAccent : kErr, kBorder);
+      }
+      return;
+    }
   }
+  // No SD: red dot instead of the bar.
+  fillCircle(outW_ - 12, 11, 4, kErr);
 }

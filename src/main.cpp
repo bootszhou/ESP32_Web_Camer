@@ -18,6 +18,7 @@
 #include "detection/motion_detector.h"
 #include "display/display_service.h"
 #include "network/network_service.h"
+#include "network/relay_client.h"
 #include "storage/event_recorder.h"
 #include "ui/ui_controller.h"
 #include "web/web_server.h"
@@ -34,6 +35,9 @@ WifiStore gWifi;
 WebServer gWeb;
 DisplayService gDisplay;
 UiController gUi;
+// Shared with the web layer (status JSON). Must stay out of the anonymous
+// namespace so web_server.cpp can reference the type via the passed pointer.
+RelayClient gRelay;
 
 // Set when the web UI changes settings, so the main loop rebuilds the module
 // configs once everything is quiet rather than mid-frame.
@@ -77,11 +81,23 @@ EventRecorder::Config recorderConfigFromSettings() {
   return c;
 }
 
+RelayClient::Config relayConfigFromSettings() {
+  const ConfigService::Settings& s = gConfig.get();
+  RelayClient::Config c;
+  c.host   = RELAY_HOST;
+  c.port   = RELAY_PORT;
+  c.token  = RELAY_TOKEN;
+  c.fps    = s.relayFps;
+  c.enabled = s.relayEnabled && RELAY_HOST[0] != 0;
+  return c;
+}
+
 // Applies everything that can change without recreating the camera.
 void applySettings() {
   gMotion.setConfig(motionConfigFromSettings());
   gRecorder.setConfig(recorderConfigFromSettings());
   gRecorder.setRecordingEnabled(gConfig.get().recordingEnabled);
+  gRelay.setConfig(relayConfigFromSettings());
 
   // Live sensor tweaks: cheap enough to reapply on every save.
   if (gCamera.isReady()) {
@@ -96,7 +112,7 @@ void printBootBanner() {
   Serial.println("#  CAM-AI  network camera                      #");
   Serial.println("#  ESP32-S3 N16R8 + OV2640 + ST7789 + microSD  #");
   Serial.println("################################################");
-  Serial.printf("firmware      : 0.5.0 (M6 buttons + panel menu)\n");
+  Serial.printf("firmware      : 0.6.0 (M7 cloud relay)\n");
   Serial.printf("flash         : %u MB\n", ESP.getFlashChipSize() / (1024 * 1024));
   Serial.printf("psram         : %s, %u MB free\n",
                 psramFound() ? "yes" : "no",
@@ -173,8 +189,12 @@ void setup() {
   gUi.begin(&gDisplay, &gConfig, &gNetwork, &gConfigDirty,
             const_cast<bool*>(&gProvisionRequest));
 
+  // Cloud relay (M7): dials out to the relay server. Dormant unless enabled in
+  // settings AND a relay host is compiled in (secrets.h).
+  gRelay.begin(&gCamera, relayConfigFromSettings());
+
   if (!gWeb.begin(&gCamera, &gNetwork, &gMotion, &gRecorder, &gConfig,
-                  &gConfigDirty, &gDisplay, &gWifi)) {
+                  &gConfigDirty, &gDisplay, &gWifi, &gRelay)) {
     Serial.println("[boot] web server failed to start");
     return;
   }
@@ -271,6 +291,10 @@ void loop() {
   }
 
   pumpRecordingFrames();
+
+  // RelayClient runs on its own task; nothing to pump here. The call below
+  // keeps the API surface honest for future loop-driven work.
+  (void)gRelay;
 
   delay(10);
 }

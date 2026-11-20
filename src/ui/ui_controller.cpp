@@ -13,7 +13,7 @@ constexpr uint32_t kBootIgnoreMs = 2000;
 // Hint line text, kept short: the panel is 240 px wide in portrait and the
 // font is 6 px per character including spacing (about 38 characters).
 constexpr const char* kHintBrowse = "GPIO46: PAGE  GPIO46 HOLD: MENU";
-constexpr const char* kHintMenu = "TAP: NEXT  HOLD: EDIT  GPIO0: EXIT";
+constexpr const char* kHintMenu = "TAP:+1  HOLD:DEC  GPIO0: EXIT";
 
 }  // namespace
 
@@ -80,12 +80,48 @@ void UiController::loop() {
 }
 
 void UiController::handleSpareButton() {
+  // While a clip is playing the keys take over playback: short press toggles
+  // pause, long press (or GPIO0) exits back to the list.
+  if (display_ && display_->isPlaying()) {
+    if (spareBtn_.consumeLongPress()) {
+      display_->stopPlayback();
+      showHint("PLAYBACK STOPPED");
+      return;
+    }
+    if (spareBtn_.consumeShortPress()) {
+      display_->togglePause();
+      return;
+    }
+    return;
+  }
+
+  // Edit-mode auto-repeat decrement. The long-press threshold is 1 s (Button's
+  // kLongPressMs); after it, holding GPIO46 steps the value DOWN every 400 ms.
+  // The one-shot consumeLongPress() below does nothing while editing, so this
+  // poll is the only decrement path. Short taps still step UP.
+  if (menuMode_ && editing_ && spareBtn_.isHeld() &&
+      spareBtn_.heldMs() >= 1000) {
+    if (millis() - editRepeatMs_ >= 400) {
+      editRepeatMs_ = millis();
+      adjustSelected(-1);
+    }
+    return;
+  }
+
   if (spareBtn_.consumeLongPress()) {
     if (!menuMode_) {
+      // On the Events page, long press starts playback of the selected clip.
+      // On any other page it enters the settings menu as before.
+      if (display_ && display_->page() == DisplayService::Page::Events) {
+        display_->requestPlayback(display_->clipSelected());
+        showHint("PLAYING...");
+        return;
+      }
       enterMenuMode();
     } else if (!editing_) {
       editing_ = true;
-      showHint("EDITING - TAP TO CHANGE");
+      editRepeatMs_ = millis();
+      showHint("EDIT: TAP +1, HOLD -1, GPIO0 EXIT");
       refreshRows();
     }
     return;
@@ -94,12 +130,22 @@ void UiController::handleSpareButton() {
   if (!spareBtn_.consumeShortPress()) return;
 
   if (!menuMode_) {
+    // On the Events page the short press moves the clip selection instead of
+    // changing pages; GPIO0 short press still leaves the page (hint below).
+    if (display_ && display_->page() == DisplayService::Page::Events) {
+      // Wrap within the actual clip count when known, else the list max.
+      const int n = display_->clipCountPublic();
+      const int next = (display_->clipSelected() + 1) % (n > 0 ? n : 4);
+      display_->setClipSelected(next);
+      return;
+    }
     cyclePage();
     return;
   }
 
   if (editing_) {
     adjustSelected(+1);
+    editRepeatMs_ = millis();  // reset the hold-decrement repeat timer
   } else {
     moveSelection(+1);
   }
@@ -120,10 +166,23 @@ void UiController::handleProvisionButton() {
 
   if (!provBtn_.consumeShortPress()) return;
 
+  // During playback GPIO0 exits to the Events list.
+  if (display_ && display_->isPlaying()) {
+    display_->stopPlayback();
+    showHint("PLAYBACK STOPPED");
+    return;
+  }
+
   if (menuMode_) {
     exitMenuMode();
   } else if (display_) {
-    // Outside the menu the key just reports the provisioning hint.
+    // On the Events page the short press cycles to the next page: GPIO46 is
+    // fully owned by selection/playback there, so without this the page is a
+    // one-way trap. On other pages the key keeps its provisioning hint.
+    if (display_->page() == DisplayService::Page::Events) {
+      cyclePage();
+      return;
+    }
     showHint("HOLD GPIO0 = PROVISION");
   }
 }

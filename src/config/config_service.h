@@ -30,17 +30,27 @@ class ConfigService {
     uint8_t frameSize = 8;          // esp32-camera framesize enum, VGA=8
     uint8_t jpegQuality = 12;       // 6..30, lower = better quality
     bool vflip = true;
-    bool hflip = false;
+    // This Freenove module's sensor reads out mirrored; hmirror=1 restores a
+    // non-mirrored view (user-confirmed against a keyboard test pattern).
+    bool hflip = true;
 
     // --- storage policy ---
     uint16_t minFreeMb = 200;       // refuse to record below this
     bool autoCleanEnabled = false;  // delete oldest when low
 
     // --- local display ---
-    // Orientation index 0..3, measured on this panel: 0 is the upright
-    // portrait letterbox that matches the web preview; 1/3 are landscape.
-    uint8_t displayRotation = 0;
+    // Orientation index 0..3, measured on this panel: 0 and 2 are portrait,
+    // 1 and 3 are landscape; 0 matches the web preview, 2 is portrait rotated
+    // 180 degrees. Default is 2 (user's preferred upright orientation).
+    uint8_t displayRotation = 2;
     uint8_t displayBrightness = 200;  // PWM duty 0..255
+
+    // --- cloud relay (M7) ---
+    // The host/token themselves live in secrets.h (build-time): they are
+    // secrets and must not round-trip through the settings JSON. Only the
+    // master switch and the push fps are user-tunable at runtime.
+    bool relayEnabled = false;
+    uint8_t relayFps = 8;  // 1..15, push fps while a viewer is watching
   };
 
   bool begin();
