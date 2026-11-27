@@ -826,26 +826,29 @@ ESP32_Web_Camer/
     ~~display/                  ST7789 驱动、字体、图标（M8 已删除）~~
     ui/                      按键（button.cpp/.h；M8 已删除菜单）
   server/                    云端：relay.js（Node 零依赖）、nginx-cam-ai-relay.conf、
-                             smoke_test.js、deploy 说明
+                             smoke_test.js、deploy.md（部署与排障手册）
   data/                      可选：网页静态资源
   test/
   tools/                     可选：录像检查/转换脚本
   docs/
     hardware.md              引脚实测表、接线、电源（TFT 部分为历史记录）
-    api.md
-    storage-format.md
-    remote-access.md
-    test-report.md
+    progress.md              里程碑、缺陷记录、实测数据（唯一的过程文档）
   PROJECT_PLAN.md
 ```
+
+> 早期规划里列过 `docs/api.md`、`docs/storage-format.md`、`docs/remote-access.md`、
+> `docs/test-report.md` 四份文档。实际没有单独成文：接口清单落在
+> `src/web/web_server.cpp` 的路由注册处与 M9 章节，AVI 格式落在 `src/storage/avi_writer.h`
+> 的头注释，远程访问落在 `server/deploy.md`，测试记录落在 `docs/progress.md`。
+> 保持两份文档而不是拆成六份，是为了避免同一件事写两遍然后不同步。
 
 最终交付：
 
 1. 可复现构建的源码、锁定依赖和分区表。
-2. 编译固件、烧录说明和配网说明。
-3. 硬件接线及引脚占用表（含扩展板实测结果）。
-4. 网页使用、录像下载、公网远程访问（服务器部署 + 设备配置）说明。
-5. 测试报告和已知限制。
+2. 编译固件、烧录说明和配网说明（见 `docs/progress.md` 的运行参数与 M8 章节）。
+3. 硬件接线及引脚占用表（含扩展板实测结果，见 `docs/hardware.md`）。
+4. 网页使用、录像下载、公网远程访问（服务器部署 + 设备配置）说明（见 `server/deploy.md`）。
+5. 测试报告和已知限制（见 `docs/progress.md` 各里程碑的实测表与「待完成事项」）。
 6. 若使用套件代码，保留对应版权和许可声明。
 
 ## 12. 推荐实施顺序与待确认项
