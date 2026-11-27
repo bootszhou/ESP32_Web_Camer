@@ -1,14 +1,50 @@
 // Smoke test for server/relay.js — simulates a device and a viewer.
-// Usage: node server/smoke_test.js  (starts relay on port 9123 internally)
+// Usage: node server/smoke_test.js   (spawns its own relay on port 9123)
 'use strict';
 const http = require('http');
 const crypto = require('crypto');
+const path = require('path');
 const { spawn } = require('child_process');
 
 const PORT = 9123;
 const TOKEN = 'test-token';
 let passed = 0, failed = 0;
 const ok = (name, cond) => { cond ? passed++ : failed++; console.log(`${cond ? 'PASS' : 'FAIL'} ${name}`); };
+
+// Relay under test. Login vars are deliberately left unset: /dev* and /login must
+// refuse everything then, and none of the cases below touch those routes.
+let relay = null;
+function startRelay() {
+  relay = spawn(process.execPath, [path.join(__dirname, 'relay.js')], {
+    env: { ...process.env, RELAY_PORT: String(PORT), RELAY_TOKEN: TOKEN,
+           RELAY_VIEW_AUTH: '', RELAY_LOGIN_USER: '', RELAY_LOGIN_PASS: '',
+           RELAY_SESSION_SECRET: '' },
+    // inherit: the relay tags its own lines with [relay], so they stay readable
+    // in-line and a crash shows up immediately.
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
+  relay.on('exit', (code, sig) => {
+    if (code !== 0 && code !== null) console.error(`relay exited early: code=${code} sig=${sig}`);
+  });
+}
+function stopRelay() {
+  if (relay && !relay.killed) { try { relay.kill('SIGTERM'); } catch {} }
+}
+// Poll /health until the listener answers, so we never race the bind().
+// Each attempt carries its own abort timeout: a socket that accepts but never
+// replies (e.g. some other program already holding 9123) would otherwise hang
+// the fetch forever and the overall deadline would never be reached.
+async function waitRelayReady(timeoutMs = 5000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(500) });
+      if (r.ok) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return false;
+}
 
 function wsKey() { return crypto.randomBytes(16).toString('base64'); }
 function acceptOf(key) {
@@ -62,6 +98,13 @@ function readFrames(socket, head, onFrame) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 (async () => {
+  startRelay();
+  if (!await waitRelayReady()) {
+    console.error(`SMOKE ERROR relay did not come up on port ${PORT}`);
+    stopRelay();
+    process.exit(2);
+  }
+
   // 1. health before anything
   const health0 = await fetch(`http://127.0.0.1:${PORT}/health`).then(r => r.json());
   ok('health ok:false initially', health0.ok === true && health0.device === false);
@@ -123,5 +166,6 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   // (server under test has auth disabled; covered by design, skip runtime check)
 
   console.log(`\n${passed} passed, ${failed} failed`);
+  stopRelay();
   process.exit(failed ? 1 : 0);
-})().catch(e => { console.error('SMOKE ERROR', e); process.exit(2); });
+})().catch(e => { console.error('SMOKE ERROR', e); stopRelay(); process.exit(2); });

@@ -32,6 +32,11 @@ const crypto = require('crypto');
 
 // ---- configuration (env or defaults) --------------------------------------
 const PORT = process.env.RELAY_PORT || 9000;
+// Bind address. The relay has no authentication of its own on the tunnel
+// routes -- nginx is the only thing in front of it -- so it must NOT be
+// reachable from the network. Loopback is the correct default; set
+// RELAY_BIND=0.0.0.0 only for a deliberate, firewalled, same-host-only trial.
+const BIND = process.env.RELAY_BIND || '127.0.0.1';
 // Pre-shared device token. MUST be overridden in production.
 const DEVICE_TOKEN = process.env.RELAY_TOKEN || 'change-me';
 // Browser Basic Auth "user:password". Empty disables auth (dev only).
@@ -721,8 +726,8 @@ setInterval(() => {
   }
 }, PING_INTERVAL_MS);
 
-server.listen(PORT, () => {
-  console.log(`[relay] listening on :${PORT} (device token ${DEVICE_TOKEN === 'change-me' ? 'DEFAULT - INSECURE' : 'set'})`);
+server.listen(PORT, BIND, () => {
+  console.log(`[relay] listening on ${BIND}:${PORT} (device token ${DEVICE_TOKEN === 'change-me' ? 'DEFAULT - INSECURE' : 'set'})`);
   if (!VIEW_AUTH) console.log('[relay] WARNING: no viewer auth (RELAY_VIEW_AUTH unset) - dev only');
   if (!LOGIN_USER || !LOGIN_PASS || !SESSION_SECRET) {
     console.log('[relay] WARNING: login not configured (RELAY_LOGIN_USER/PASS/' +

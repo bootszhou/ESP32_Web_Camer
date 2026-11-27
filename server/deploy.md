@@ -23,10 +23,11 @@ Cloud Linux 3）的完整步骤。做完之后，外网用浏览器登录即可�
 | 系统 | systemd + nginx + dnf/apt | Alibaba Cloud Linux 3 (Anolis)，kernel 5.10 |
 | Node.js | ≥ 18（用到 `crypto.timingSafeEqual`、`base64url`） | v20.19.5，装在 `/opt/nodejs` |
 | nginx | 需要 `http_ssl_module`、`http_v2_module`、**`http_sub_module`** | 1.28.3（宝塔面板自带，模块齐全） |
-| 端口 | 只需对外开 **443** | 9000 只绑本机，安全组不要放行 |
+| 端口 | 只需对外开 **443** | relay 绑 `127.0.0.1:9000`，安全组不要放行 |
 
-> ⚠️ **9000 必须只对本机开放**。它没有任何鉴权，认证全在 nginx。若把 9000 暴露到
-> 公网，等于绕过登录页直连设备。
+> ⚠️ **9000 必须只对本机开放**。relay 的隧道路由没有任何鉴权，认证全在 nginx。
+> 代码里 `RELAY_BIND` 默认就是 `127.0.0.1`，这是第二道保险——安全组规则可能被改，
+> 但绑定地址不会；两层都生效才算稳妥。若把 9000 暴露到公网，等于绕过登录页直连设备。
 
 检查 nginx 模块：
 
@@ -151,6 +152,7 @@ chmod 644 /var/www/cam-ai/camai-root-ca.crt
 ```bash
 cat > /etc/cam-ai/relay.env <<'EOF'
 RELAY_PORT=9000
+RELAY_BIND=127.0.0.1
 
 # 设备 hello 帧的预共享令牌，必须与 secrets.h 的 RELAY_TOKEN 一致
 RELAY_TOKEN=<32 字节 hex 随机串>
@@ -177,6 +179,8 @@ openssl rand -hex 32
 
 | 变量 | 作用 |
 |---|---|
+| `RELAY_PORT` | 监听端口，默认 9000 |
+| `RELAY_BIND` | **监听地址，默认 `127.0.0.1`**。relay 自身的隧道路由没有鉴权（鉴权全在 nginx），所以默认只绑回环；`ss -lntp \| grep 9000` 应显示 `127.0.0.1:9000` 而不是 `*:9000` |
 | `RELAY_TOKEN` | 设备认证。错了设备连不上，但登录页仍可用 |
 | `RELAY_DEVICE_ID` | 多设备时的设备标识，需与固件 `Config.deviceId` 一致 |
 | `RELAY_VIEW_AUTH` | M7 时代的 Basic Auth，M9 后仅作旧客户端兜底 |
@@ -240,7 +244,7 @@ journalctl -u cam-ai-relay -n 20 --no-pager
 正常日志：
 
 ```
-[relay] listening on :9000 (device token set)
+[relay] listening on 127.0.0.1:9000 (device token set)
 [device] authenticated dev=cam-01           # 设备连上后
 ```
 
@@ -293,13 +297,18 @@ nginx -s reload
 curl -s http://127.0.0.1:9000/health
 curl -sk https://127.0.0.1/health
 # {"ok":true,"device":false,"viewers":0,"push":false,"uptime_s":...,"tunnels":0}
+
+# 监听地址必须是回环
+ss -lntp | grep 9000
+# LISTEN ... 127.0.0.1:9000 ... users:(("node",...))       ← 正确
+# LISTEN ...        *:9000 ...                             ← 绑宽了，检查 RELAY_BIND
 ```
 
 ### 7.2 登录链路
 
 ```bash
-# 无 Cookie → 401
-curl -s -o /dev/null -w '%{http_code}\n' -k https://127.0.0.1/auth          # 401
+# 无 Cookie 访问受保护资源 → API 401
+curl -s -o /dev/null -w '%{http_code}\n' -k https://127.0.0.1/api/v1/status   # 401
 # 页面无 Cookie → 302 到 /login
 curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' -k https://127.0.0.1/  # 302 .../login
 
@@ -310,8 +319,18 @@ curl -s -k -D - -o /dev/null -X POST https://127.0.0.1/login \
 
 # 带上 Cookie 再用
 CK=<上面 cookie 的值>
-curl -s -o /dev/null -w '%{http_code}\n' -k -H "Cookie: camai_sess=$CK" https://127.0.0.1/auth  # 204
-curl -s -k -H "Cookie: camai_sess=$CK" https://127.0.0.1/api/v1/status
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -k -H "Cookie: camai_sess=$CK" https://127.0.0.1/api/v1/status   # 200
+```
+
+`/auth` 是给 nginx `auth_request` 用的**内部端点**（配置里是 `location = /_auth`,
+`internal`），所以从 443 直接访问只会命中白名单兜底拿 404，这是对的、不是故障。
+想单独验它就走 relay 自己的 9000 端口：
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9000/auth   # 401 无 Cookie
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Cookie: camai_sess=$CK" http://127.0.0.1:9000/auth              # 204 Cookie 有效
 ```
 
 > 部分环境下 `curl -c/-b` 的 cookie jar 不可靠，用 `-H "Cookie: camai_sess=..."`
@@ -335,19 +354,21 @@ curl -s -k -o /dev/null -w '%{http_code} %{size_download}\n' \
 `smoke_test.js` 自带一个模拟设备和模拟观看者，覆盖握手、令牌校验、`start_stream`、
 二进制转发、`stop_stream`、MJPEG 头与载荷。
 
-**它不会自己启动 relay**（顶部 `spawn` 引入后从未使用，是个已知瑕疵），必须先手动
-起一个临时实例：
+**它在 9123 端口自己拉起一个 relay 实例**，跑完自动关掉，所以只要一条命令：
 
 ```bash
 cd /opt/cam-ai
-RELAY_PORT=9123 RELAY_TOKEN=test-token node relay.js &
-sleep 1
 node smoke_test.js
-# 期望：11 passed, 0 failed
-kill %1
+# 期望：最后一行 11 passed, 0 failed，退出码 0
 ```
 
-临时实例不设 `RELAY_VIEW_AUTH`，所以脚本里依赖 Basic Auth 的用例会自动跳过。
+它注入的环境是 `RELAY_PORT=9123 RELAY_TOKEN=test-token`，且把 `RELAY_VIEW_AUTH`、
+`RELAY_LOGIN_*`、`RELAY_SESSION_SECRET` 全部清空——因此登录与 `/dev*` 隧道在本次
+测试里是关闭的，脚本里依赖 Basic Auth 的用例会跳过。**这不会连到生产实例**：端口不同、
+环境变量不同，`/opt/cam-ai/relay.env` 也不参与。
+
+> 如果 9123 被占用，脚本会在等待健康检查 5 秒后报
+> `SMOKE ERROR relay did not come up on port 9123` 并以退出码 2 结束。
 
 ---
 
@@ -422,7 +443,9 @@ journalctl -u cam-ai-relay -n 50 --no-pager | grep -i 'device\|auth'
    漏了，或 `http_sub_module` 没编进去。
 2. 浏览器控制台有没有 `Mixed Content` 报错。有 → 注入没生效，`<img>` 还在打 `:81`。
 3. `curl -k -H "Cookie: ..." https://IP/dev81/stream` 能不能出字节。不出 → 隧道问题，
-   看设备 `GET /api/v1/status` 的 `relay.tunnels`。
+   看 relay 的 `curl -s http://127.0.0.1:9000/health` 里的 `tunnels` 计数与
+   `journalctl -u cam-ai-relay` 的隧道日志（设备端 `/api/v1/status` 只报
+   `relay.connected/viewer/frames_sent`，没有 tunnels 字段）。
 
 ### 隧道 502 `device busy` / `tunnel busy`
 

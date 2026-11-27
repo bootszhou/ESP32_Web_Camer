@@ -311,6 +311,10 @@ bytes_sent/reconnects/last_error）。
 health 初始态、WS 握手 Accept 头、hello 认证、错误 token 拒绝、
 start_stream 下发、binary 帧透传、stop_stream、MJPEG 流。
 
+脚本自带 `spawn`，会在 9123 端口起一个临时 relay 实例、跑完自己关掉
+（早先版本引入了 `spawn` 却从未调用，必须先手工起实例才能跑，属自伤型瑕疵，
+2026-11-27 已修）。
+
 ### M7 期间发现的缺陷
 
 **13. 设备通道被未认证连接抢占（冒烟测试发现）**
@@ -381,6 +385,9 @@ Basic 检查依然成立。
 只有画面、状态指示、重新连接三样；要管理就回到局域网。
 
 **安全组只放行 443**；9000 仅本机监听，公网不可达（实测超时，符合预期）。
+早先这是唯一的防线——`server.listen(PORT)` 绑的是 `0.0.0.0`，只靠安全组挡着。
+2026-11-27 补了第二层：新增 `RELAY_BIND`，默认 `127.0.0.1`，`ss -lntp` 现为
+`127.0.0.1:9000` 而非 `*:9000`。
 nginx 对 `/devices/`、`/view`、`/stream.mjpeg` 全部 `proxy_buffering off`，
 WS 的 `proxy_read_timeout 3600s` 让 30s 心跳有充足余量。
 
