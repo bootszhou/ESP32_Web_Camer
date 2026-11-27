@@ -1,7 +1,7 @@
 // CameraService -- the ONE place that talks to the camera.
 //
-// Everything else (web stream, motion detection, local display, recording)
-// must obtain frames through this service. Calling esp_camera_fb_get() from
+// Everything else (web stream, motion detection, recording) must obtain frames
+// through this service. Calling esp_camera_fb_get() from
 // multiple modules would make the frame buffers fight each other and produce
 // tearing, dropped frames and inconsistent detection.
 #pragma once

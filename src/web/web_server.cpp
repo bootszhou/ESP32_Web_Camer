@@ -278,11 +278,6 @@ const char* kIndexHtml = R"HTML(<!DOCTYPE html>
     <div class="row"><label for="s_hflip">画面左右翻转 (镜像)</label>
       <small class="hint">默认开启：校正传感器镜像；文字应为正向可读</small>
       <input type="checkbox" id="s_hflip" checked></div>
-    <div class="row"><label>屏幕方向<br>
-      <small class="hint">依次点击找到正确方向</small></label>
-      <button class="btn" id="rotBtn" style="font-size:12px;padding:3px 12px">
-        旋转 90°</button>
-      <span class="val" id="rotVal">0</span></div>
     <div class="actions">
       <button class="btn" id="saveBtn">保存设置</button>
       <button class="btn danger" id="cleanBtn">立即清理空间</button>
@@ -331,6 +326,14 @@ let streamStaleCount = 0;  // consecutive polls with a stalled stream frame age
 const BLANK_PIXEL =
   'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
 
+// Video and replay live on the second httpd (port 81) so that an endless MJPEG
+// response can never starve the API task on port 80. On the LAN we therefore
+// point straight at :81. When this page is served through the cloud relay the
+// tunnel exposes that port under /dev/, and mixed-content rules forbid
+// http://... from an https:// page, so the base has to be injectable.
+const STREAM_BASE = window.__CAMAI_STREAM_BASE ||
+  ('http://' + location.hostname + ':81');
+
 function detachCam() {
   cam.src = BLANK_PIXEL;
 }
@@ -369,7 +372,7 @@ async function startStream() {
   streaming = true;
   document.getElementById('playbackBar').style.display = 'none';
   document.getElementById('liveBar').style.display = 'flex';
-  cam.src = 'http://' + location.hostname + ':81/stream?t=' + Date.now();
+  cam.src = STREAM_BASE + '/stream?t=' + Date.now();
   overlay.classList.add('hidden');
 }
 
@@ -485,7 +488,7 @@ async function playClip(dir, name) {
   // has seen. Minting one here broke playback after a page reload.
   const token = await requestPlayToken();
   if (gen !== playbackToken) return;  // another clip was picked while waiting
-  cam.src = 'http://' + location.hostname + ':81/playback?dir=' +
+  cam.src = STREAM_BASE + '/playback?dir=' +
             encodeURIComponent(dir) + '&name=' + encodeURIComponent(name) +
             '&token=' + token;
 
@@ -604,7 +607,7 @@ async function poll() {
         cam.src = BLANK_PIXEL;
         setTimeout(() => {
           if (streaming) {
-            cam.src = 'http://' + location.hostname + ':81/stream?t=' + Date.now();
+            cam.src = STREAM_BASE + '/stream?t=' + Date.now();
           }
         }, 300);
       }
@@ -1007,33 +1010,6 @@ document.getElementById('saveBtn').addEventListener('click', async () => {
   }
 });
 
-// ---- display rotation -----------------------------------------------------
-// Cycles the panel through the four orientations at runtime so the correct
-// one can be found by looking at the screen instead of re-flashing.
-// 0/2 = portrait letterbox (0 is upright, matches the web preview),
-// 1/3 = full-screen landscape.
-let rotIndex = 0;
-document.getElementById('rotBtn').addEventListener('click', async () => {
-  rotIndex = (rotIndex + 1) & 3;
-  const msg = document.getElementById('saveMsg');
-  try {
-    const r = await fetch('/api/v1/display/rotate?r=' + rotIndex,
-                          { method: 'POST' });
-    const d = await r.json();
-    if (d.ok) {
-      document.getElementById('rotVal').textContent = d.rotation;
-      msg.textContent = '屏幕方向 ' + d.rotation + '（0/2=竖屏，1/3=横屏；0 与网页同向）';
-      msg.style.color = '#3fb950';
-    } else {
-      msg.textContent = '旋转失败: ' + (d.error || 'unknown');
-      msg.style.color = '#f85149';
-    }
-  } catch (e) {
-    msg.textContent = '旋转失败，设备无响应';
-    msg.style.color = '#f85149';
-  }
-});
-
 document.getElementById('cleanBtn').addEventListener('click', async () => {
   const msg = document.getElementById('saveMsg');
   if (!confirm('删除最旧的录像以释放空间？')) return;
@@ -1091,15 +1067,13 @@ uint32_t WebServer::playbackClients_ = 0;
 bool WebServer::begin(CameraService* camera, NetworkService* network,
                       MotionDetector* motion, EventRecorder* recorder,
                       ConfigService* config, volatile bool* settingsDirty,
-                      DisplayService* display, WifiStore* wifi,
-                      RelayClient* relay) {
+                      WifiStore* wifi, RelayClient* relay) {
   camera_ = camera;
   network_ = network;
   motion_ = motion;
   recorder_ = recorder;
   config_ = config;
   settingsDirty_ = settingsDirty;
-  display_ = display;
   wifi_ = wifi;
   relay_ = relay;
   instance_ = this;
@@ -1108,7 +1082,10 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
   cfg.server_port = 80;
   cfg.ctrl_port = 32768;
   cfg.max_uri_handlers = 16;
-  cfg.max_open_sockets = 5;     // status polls + snapshot + motion preview
+  // Each in-flight tunnel request occupies one socket on this server, and the
+  // cloud page arrives as several parallel fetches. 8 covers the page's own
+  // four pollers plus a second tab without starving a LAN client.
+  cfg.max_open_sockets = 8;
   cfg.lru_purge_enable = true;  // reclaim sockets from dead browser tabs
   cfg.stack_size = 8192;
 
@@ -1144,10 +1121,6 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
                           .handler = handleCleanup, .user_ctx = nullptr};
   httpd_uri_t uriStop = {.uri = "/api/v1/recording/stop", .method = HTTP_POST,
                          .handler = handleStopRecording, .user_ctx = nullptr};
-  // Runtime display rotation, used to find the correct panel orientation
-  // without re-flashing. Safe to leave in: it only rewrites MADCTL.
-  httpd_uri_t uriRotate = {.uri = "/api/v1/display/rotate", .method = HTTP_POST,
-                           .handler = handleRotate, .user_ctx = nullptr};
   // WiFi credentials. Separate from /api/v1/config on purpose: these are
   // secrets and must never round-trip through the settings JSON.
   httpd_uri_t uriWifiGet = {.uri = "/api/v1/wifi", .method = HTTP_GET,
@@ -1168,7 +1141,6 @@ bool WebServer::begin(CameraService* camera, NetworkService* network,
   httpd_register_uri_handler(server_, &uriSetCfg);
   httpd_register_uri_handler(server_, &uriClean);
   httpd_register_uri_handler(server_, &uriStop);
-  httpd_register_uri_handler(server_, &uriRotate);
   httpd_register_uri_handler(server_, &uriWifiGet);
   httpd_register_uri_handler(server_, &uriWifiSet);
 
@@ -1333,7 +1305,7 @@ esp_err_t WebServer::handleStatus(httpd_req_t* req) {
            rs ? (unsigned long)rs->totalMb : 0,
            rs ? (unsigned long)rs->framesDropped : 0,
            rs ? rs->lastError : "",
-           "0.6.0");
+           "0.8.0");
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -1829,40 +1801,6 @@ esp_err_t WebServer::handleStopRecording(httpd_req_t* req) {
   snprintf(out, sizeof(out),
            "{\"ok\":true,\"was_recording\":%s,\"stopped\":%s}",
            wasRecording ? "true" : "false", stopped ? "true" : "false");
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
-  return ESP_OK;
-}
-
-esp_err_t WebServer::handleRotate(httpd_req_t* req) {
-  WebServer* self = instance_;
-  if (!self || !self->display_) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-
-  // Rotation comes from the query string: /api/v1/display/rotate?r=1
-  char query[32];
-  int r = -1;
-  if (httpd_req_get_url_query_len(req) > 0 &&
-      httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-    char val[8];
-    if (httpd_query_key_value(query, "r", val, sizeof(val)) == ESP_OK) {
-      r = atoi(val);
-    }
-  }
-  if (r < 0 || r > 3) {
-    httpd_resp_set_status(req, "400 Bad Request");
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, "{\"ok\":false,\"error\":\"r must be 0..3\"}",
-                    HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-  }
-
-  self->display_->setRotation((uint8_t)r);
-
-  char out[80];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"rotation\":%d}", r);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
   return ESP_OK;

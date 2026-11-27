@@ -34,28 +34,13 @@ constexpr int CAM_PIN_PCLK  = 13;
 
 // ---------------------------------------------------------------------------
 // microSD -- 1-bit SDMMC.
-// IMPORTANT: GPIO38 is shared with the TFT backlight on the extension board.
-// The backlight has been rewired to GPIO42 (see TFT_PIN_BL below), which is
-// what makes this pin available for SD again.
+// GPIO38 previously carried the TFT backlight on the extension board; the panel
+// has been removed from this build (docs/progress.md M8), so the pin is a plain
+// SD data line again.
 // ---------------------------------------------------------------------------
 constexpr int SD_PIN_CLK = 39;
 constexpr int SD_PIN_CMD = 38;
 constexpr int SD_PIN_D0  = 40;
-
-// ---------------------------------------------------------------------------
-// TFT (ST7789, 240x320, 4-wire SPI, no touch).
-// BL was moved from its original GPIO38 to GPIO42 to free the SD CMD line.
-// DC/RST/CS/SCL/SDA are as measured and must not overlap the camera or SD.
-// ---------------------------------------------------------------------------
-// Rewired 2026-11-13: original pins 19/20 are USB D-/D+ and crash the SoC.
-// Second attempt used GPIO9/GPIO14 but GPIO9 is camera D1. Final wiring:
-//   SCL -> GPIO41, SDA -> GPIO2 (both verified idle in docs/hardware.md).
-constexpr int TFT_PIN_SCLK = 41;
-constexpr int TFT_PIN_MOSI = 2;
-constexpr int TFT_PIN_RST  = 21;
-constexpr int TFT_PIN_CS   = 45;
-constexpr int TFT_PIN_DC   = 47;
-constexpr int TFT_PIN_BL   = 42;  // rewired from 38
 
 // ---------------------------------------------------------------------------
 // Buttons
@@ -64,7 +49,9 @@ constexpr int TFT_PIN_BL   = 42;  // rewired from 38
 // GPIO46 is a strapping pin too, measured LOW at power-on (safe, ROM logs on).
 // ---------------------------------------------------------------------------
 constexpr int BTN_PROVISION = 0;   // "interrupt/network" button on extension board
-constexpr int BTN_SPARE     = 46;  // "reserved" button on extension board
+// The "reserved" button is still wired, but nothing uses it now that the local
+// panel and its menu are gone (docs/progress.md M8). Kept as a hardware fact.
+constexpr int BTN_SPARE     = 46;
 
 // ---------------------------------------------------------------------------
 // Onboard WS2812 status LED

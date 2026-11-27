@@ -1,8 +1,18 @@
 #include "network_service.h"
 
+#include <time.h>
+
 namespace {
 // Character buffer for the AP SSID so apSsid() can return a stable pointer.
 char gApSsid[32] = {0};
+
+// Anything before 2024-01-01 means SNTP has not landed yet. Compared as an
+// epoch threshold so the logic does not care about the actual timezone.
+constexpr time_t kPlausibleEpoch = 1704067200;
+
+// Two public pools; sntp keeps trying until one answers.
+const char* const kNtpServer1 = "ntp.aliyun.com";
+const char* const kNtpServer2 = "pool.ntp.org";
 }  // namespace
 
 bool NetworkService::begin(const char* ssid, const char* password) {
@@ -33,6 +43,7 @@ bool NetworkService::begin(const char* ssid, const char* password) {
   if (isConnected()) {
     Serial.printf("[net] connected to %s, IP %s, RSSI %d dBm\n",
                   ssid_, WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    startTimeSync();
   } else {
     Serial.println("[net] not connected yet, will keep retrying in background");
   }
@@ -44,6 +55,36 @@ void NetworkService::startConnect() {
   WiFi.begin(ssid_, pass_);
   started_ = true;
   nextAttemptMs_ = millis() + 15000;  // give this attempt 15s to succeed
+}
+
+void NetworkService::startTimeSync() {
+  // configTime is idempotent and cheap, but re-arming it on every loop pass
+  // would restart the SNTP request flood. Only call it on a fresh attempt.
+  configTime(0, 0, kNtpServer1, kNtpServer2);
+  ntpStartedMs_ = millis();
+  timeSynced_ = false;
+}
+
+void NetworkService::pollTimeSync() {
+  const time_t now = time(nullptr);
+  if (now > kPlausibleEpoch) {
+    if (!timeSynced_) {
+      timeSynced_ = true;
+      struct tm tmv;
+      localtime_r(&now, &tmv);
+      char stamp[32];
+      strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+      Serial.printf("[net] clock synced: %s (UTC)\n", stamp);
+    }
+    return;
+  }
+
+  // Not synced yet: retry occasionally in case the first servers were
+  // unreachable (captive portal, DNS not up yet, etc.).
+  if (millis() - ntpStartedMs_ > kNtpRetryMs) {
+    Serial.println("[net] clock still unset; retrying SNTP");
+    startTimeSync();
+  }
 }
 
 void NetworkService::loop() {
@@ -115,6 +156,9 @@ void NetworkService::loop() {
     // Reset backoff once we get through, so the next outage retries promptly.
     backoffMs_ = 2000;
     offlineSinceMs_ = 0;
+    // Arm the clock on first association after boot (or after a retry reset).
+    if (ntpStartedMs_ == 0) startTimeSync();
+    pollTimeSync();
     return;
   }
 

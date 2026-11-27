@@ -24,6 +24,12 @@ class NetworkService {
   IPAddress localIp() const { return WiFi.localIP(); }
   int32_t rssi() const { return isConnected() ? WiFi.RSSI() : 0; }
 
+  // True once SNTP has produced a plausible wall clock. TLS certificate
+  // validation needs this: an ESP32 boots at 1970, so a server cert whose
+  // notBefore is later fails verification with MBEDTLS_ERR_X509_CERT_VERIFY_FAILED
+  // (-9984) until the clock is set.
+  bool timeSynced() const { return timeSynced_; }
+
   const char* statusText() const;
 
   // ---- runtime provisioning ----------------------------------------------
@@ -54,6 +60,8 @@ class NetworkService {
 
  private:
   void startConnect();
+  void startTimeSync();
+  void pollTimeSync();
 
   const char* ssid_ = nullptr;
   const char* pass_ = nullptr;
@@ -85,4 +93,12 @@ class NetworkService {
   // opened automatically as a rescue path (60 s).
   uint32_t offlineSinceMs_ = 0;
   static constexpr uint32_t kOfflineApAfterMs = 60000;
+
+  // Wall clock (SNTP). Recording timestamps and TLS cert validation both need a
+  // real date, so it is started as soon as the station associates. Retried on
+  // every reconnect: a router that is slow to reach the internet must not leave
+  // the device permanently stuck at 1970.
+  bool timeSynced_ = false;
+  uint32_t ntpStartedMs_ = 0;
+  static constexpr uint32_t kNtpRetryMs = 30000;
 };

@@ -16,11 +16,10 @@
 #include "config/config_service.h"
 #include "config/wifi_store.h"
 #include "detection/motion_detector.h"
-#include "display/display_service.h"
 #include "network/network_service.h"
 #include "network/relay_client.h"
 #include "storage/event_recorder.h"
-#include "ui/ui_controller.h"
+#include "ui/button.h"
 #include "web/web_server.h"
 #include "secrets.h"
 
@@ -33,8 +32,9 @@ EventRecorder gRecorder;
 ConfigService gConfig;
 WifiStore gWifi;
 WebServer gWeb;
-DisplayService gDisplay;
-UiController gUi;
+// Only the provisioning key survives: the local panel and its menu are gone, so
+// the button that opens the setup AP is now driven directly here.
+Button gProvBtn;
 // Shared with the web layer (status JSON). Must stay out of the anonymous
 // namespace so web_server.cpp can reference the type via the passed pointer.
 RelayClient gRelay;
@@ -43,9 +43,14 @@ RelayClient gRelay;
 // configs once everything is quiet rather than mid-frame.
 volatile bool gConfigDirty = false;
 
-// Raised by the UI on a long press of the provisioning key. Handled in loop()
-// so the AP comes up outside the button handler.
+// Raised by the long press of the provisioning key. Handled in loop() so the AP
+// comes up outside the button handler.
 volatile bool gProvisionRequest = false;
+
+// Ignore button input for this long after power-on: GPIO0 is the BOOT strapping
+// pin sampled by the ROM, and the rails are still settling. Without this a
+// spurious edge could look like a provisioning request.
+constexpr uint32_t kButtonBootIgnoreMs = 2000;
 
 // The recorder needs a frame for every capture while a clip is running, while
 // the web stream also pulls frames. This pump only runs during recording so it
@@ -110,9 +115,9 @@ void printBootBanner() {
   Serial.println();
   Serial.println("################################################");
   Serial.println("#  CAM-AI  network camera                      #");
-  Serial.println("#  ESP32-S3 N16R8 + OV2640 + ST7789 + microSD  #");
+  Serial.println("#  ESP32-S3 N16R8 + OV2640 + microSD           #");
   Serial.println("################################################");
-  Serial.printf("firmware      : 0.6.0 (M7 cloud relay)\n");
+  Serial.printf("firmware      : 0.8.0 (headless + cloud tunnel)\n");
   Serial.printf("flash         : %u MB\n", ESP.getFlashChipSize() / (1024 * 1024));
   Serial.printf("psram         : %s, %u MB free\n",
                 psramFound() ? "yes" : "no",
@@ -166,35 +171,21 @@ void setup() {
   // which is what NetworkService expects when it keeps the pointers.
   gNetwork.begin(netSsid, netPass);
 
-  // Display first so the web layer can expose its rotation control; it is
-  // still the lowest-priority consumer and must not block anything if it fails.
-  DisplayService::Config dispCfg;
-  dispCfg.brightness = s.displayBrightness;
-  dispCfg.fpsTarget = 8;
-  // Auto-off is safe now that M6 supplies a wake source: UiController calls
-  // updateActivity() on every button press, and setPage() re-lights the panel.
-  // Before that, any autoOffSec > 0 blanked the screen with no way back.
-  dispCfg.autoOffSec = 60;
-  if (!gDisplay.begin(&gCamera, &gNetwork, &gRecorder, dispCfg)) {
-    Serial.println("[boot] display unavailable; continuing without it");
-  } else {
-    // Orientation is a per-panel property measured on this module: portrait
-    // index 0 shows the picture upright (letterboxed, matching the web
-    // preview). Persisted so a reboot keeps it.
-    gDisplay.setRotation(s.displayRotation);
-  }
-
-  // Buttons and on-panel menu. Started before the web server so the panel shows
-  // a page immediately, and it tolerates a missing display (gDisplay.isReady()).
-  gUi.begin(&gDisplay, &gConfig, &gNetwork, &gConfigDirty,
-            const_cast<bool*>(&gProvisionRequest));
+  // The local panel and its menu are gone (see docs/progress.md M8). The only
+  // physical control left is the provisioning key: a long press opens the setup
+  // AP, which is the recovery path when the stored credentials are wrong.
+  gProvBtn.begin(board::BTN_PROVISION);
+  // GPIO0 is the BOOT strapping pin; holding it at reset selects download mode,
+  // so input stays disabled until the boot window has passed (see loop()).
+  gProvBtn.setEnabled(false);
+  Serial.printf("[boot] provision key on GPIO%d\n", board::BTN_PROVISION);
 
   // Cloud relay (M7): dials out to the relay server. Dormant unless enabled in
   // settings AND a relay host is compiled in (secrets.h).
   gRelay.begin(&gCamera, relayConfigFromSettings());
 
   if (!gWeb.begin(&gCamera, &gNetwork, &gMotion, &gRecorder, &gConfig,
-                  &gConfigDirty, &gDisplay, &gWifi, &gRelay)) {
+                  &gConfigDirty, &gWifi, &gRelay)) {
     Serial.println("[boot] web server failed to start");
     return;
   }
@@ -224,8 +215,26 @@ void loop() {
     if (gNetwork.ssid()) lastSsid = gNetwork.ssid();
   }
 
-  // Buttons and menu. Non-blocking; also drives the backlight activity timer.
-  gUi.loop();
+  // Provisioning key only. Non-blocking debounce, so this cannot stall the
+  // recorder pump below.
+  {
+    static bool bootIgnored = false;
+    static uint32_t bootMs = millis();
+    gProvBtn.update();
+    if (!bootIgnored && millis() - bootMs >= kButtonBootIgnoreMs) {
+      bootIgnored = true;
+      gProvBtn.setEnabled(true);
+      // Drop anything latched during the ignore window.
+      gProvBtn.consumeShortPress();
+      gProvBtn.consumeLongPress();
+      Serial.println("[boot] provision key enabled");
+    }
+    if (bootIgnored && gProvBtn.consumeLongPress()) {
+      gProvisionRequest = true;
+    }
+    // The short press has no local action left; drain it so it cannot queue up.
+    if (bootIgnored) gProvBtn.consumeShortPress();
+  }
 
   // Long press of the provisioning key: bring up the temporary AP. Done here
   // rather than in the button handler so the radio change happens in a known
@@ -270,24 +279,6 @@ void loop() {
     gConfigDirty = false;
     applySettings();
     Serial.println("[boot] settings applied");
-  }
-
-  // Keep the panel's display config in step with the saved settings, so a
-  // brightness/rotation change made on the web page shows up without a reboot.
-  {
-    const ConfigService::Settings& cur = gConfig.get();
-    static uint8_t lastBrightness = 0xFF;
-    static uint8_t lastRotation = 0xFF;
-    if (cur.displayBrightness != lastBrightness) {
-      lastBrightness = cur.displayBrightness;
-      gDisplay.setBrightness(cur.displayBrightness);
-    }
-    if (cur.displayRotation != lastRotation) {
-      lastRotation = cur.displayRotation;
-      if (gDisplay.isReady() && gDisplay.rotation() != cur.displayRotation) {
-        gDisplay.setRotation(cur.displayRotation);
-      }
-    }
   }
 
   pumpRecordingFrames();

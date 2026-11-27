@@ -38,13 +38,6 @@ class ConfigService {
     uint16_t minFreeMb = 200;       // refuse to record below this
     bool autoCleanEnabled = false;  // delete oldest when low
 
-    // --- local display ---
-    // Orientation index 0..3, measured on this panel: 0 and 2 are portrait,
-    // 1 and 3 are landscape; 0 matches the web preview, 2 is portrait rotated
-    // 180 degrees. Default is 2 (user's preferred upright orientation).
-    uint8_t displayRotation = 2;
-    uint8_t displayBrightness = 200;  // PWM duty 0..255
-
     // --- cloud relay (M7) ---
     // The host/token themselves live in secrets.h (build-time): they are
     // secrets and must not round-trip through the settings JSON. Only the

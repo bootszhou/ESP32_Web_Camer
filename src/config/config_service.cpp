@@ -64,9 +64,6 @@ void ConfigService::loadFromNvs() {
   s_.minFreeMb         = getU32("minfree", s_.minFreeMb);
   s_.autoCleanEnabled  = getU32("autocln", s_.autoCleanEnabled ? 1 : 0) != 0;
 
-  s_.displayRotation   = getU32("disprot", s_.displayRotation);
-  s_.displayBrightness = getU32("dispbrt", s_.displayBrightness);
-
   s_.relayEnabled      = getU32("relayen", s_.relayEnabled ? 1 : 0) != 0;
   s_.relayFps          = getU32("relayfps", s_.relayFps);
 }
@@ -94,9 +91,6 @@ void ConfigService::validate() {
 
   s_.minFreeMb   = constrain(s_.minFreeMb, 10, 30000);
 
-  s_.displayRotation = constrain(s_.displayRotation, 0, 3);
-  s_.displayBrightness = constrain(s_.displayBrightness, 0, 255);
-
   s_.relayFps = constrain(s_.relayFps, 1, 15);
 }
 
@@ -121,9 +115,6 @@ bool ConfigService::save() {
 
   putOr("minfree", s_.minFreeMb);
   putOr("autocln", s_.autoCleanEnabled ? 1 : 0);
-
-  putOr("disprot", s_.displayRotation);
-  putOr("dispbrt", s_.displayBrightness);
 
   putOr("relayen", s_.relayEnabled ? 1 : 0);
   putOr("relayfps", s_.relayFps);
@@ -154,9 +145,6 @@ String ConfigService::toJson() const {
 
   doc["min_free_mb"]      = s_.minFreeMb;
   doc["auto_clean"]       = s_.autoCleanEnabled;
-
-  doc["display_rotation"]   = s_.displayRotation;
-  doc["display_brightness"] = s_.displayBrightness;
 
   doc["relay_enabled"] = s_.relayEnabled;
   doc["relay_fps"]     = s_.relayFps;
@@ -223,9 +211,6 @@ bool ConfigService::updateFromJson(const char* json, size_t len, String& error) 
   if (!asBool("vflip", next.vflip)) return false;
   if (!asBool("hflip", next.hflip)) return false;
   if (!asBool("auto_clean", next.autoCleanEnabled)) return false;
-
-  if (!asU8("display_rotation", next.displayRotation, 0, 3)) return false;
-  if (!asU8("display_brightness", next.displayBrightness, 0, 255)) return false;
 
   if (!asBool("relay_enabled", next.relayEnabled)) return false;
   if (!asU8("relay_fps", next.relayFps, 1, 15)) return false;

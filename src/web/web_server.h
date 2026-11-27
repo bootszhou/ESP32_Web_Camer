@@ -12,7 +12,6 @@
 #include "config/config_service.h"
 #include "config/wifi_store.h"
 #include "detection/motion_detector.h"
-#include "display/display_service.h"
 #include "network/network_service.h"
 #include "storage/event_recorder.h"
 
@@ -24,7 +23,6 @@ class WebServer {
              MotionDetector* motion = nullptr, EventRecorder* recorder = nullptr,
              ConfigService* config = nullptr,
              volatile bool* settingsDirty = nullptr,
-             DisplayService* display = nullptr,
              WifiStore* wifi = nullptr,
              class RelayClient* relay = nullptr);
   void end();
@@ -47,7 +45,6 @@ class WebServer {
   static esp_err_t handleSetConfig(httpd_req_t* req);
   static esp_err_t handleCleanup(httpd_req_t* req);
   static esp_err_t handleStopRecording(httpd_req_t* req);
-  static esp_err_t handleRotate(httpd_req_t* req);
   static esp_err_t handleWifiGet(httpd_req_t* req);
   static esp_err_t handleWifiSet(httpd_req_t* req);
 
@@ -70,7 +67,6 @@ class WebServer {
   EventRecorder* recorder_ = nullptr;
   ConfigService* config_ = nullptr;
   volatile bool* settingsDirty_ = nullptr;
-  DisplayService* display_ = nullptr;
   // Credentials live outside ConfigService so they never appear in the public
   // settings JSON. May be null if NVS failed; the endpoints then report 503.
   WifiStore* wifi_ = nullptr;
