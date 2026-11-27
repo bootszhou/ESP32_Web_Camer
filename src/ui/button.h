@@ -31,7 +31,9 @@ class Button {
 
  private:
   static constexpr uint32_t kDebounceMs = 25;
-  static constexpr uint32_t kLongPressMs = 1000;
+  // 3 s matches what the web page tells the user ("长按配网键 3 秒开热点") and
+  // keeps a grazed key from opening an open SoftAP by accident.
+  static constexpr uint32_t kLongPressMs = 3000;
 
   int pin_ = -1;
   bool enabled_ = true;

@@ -34,7 +34,7 @@
           单段实测约 2.6-2.9 MB, 110-125 帧
 SD      : CLK=39 CMD=38 D0=40 (1-bit SDMMC)
 显示    : 无（本地 LCD 已于 M8 移除）
-按键    : GPIO0 = 配网键，上电 2 秒后长按进入配网 AP
+按键    : GPIO0 = 配网键，上电 2 秒后长按 3 秒进入配网 AP
 配置    : 全部存 NVS (namespace "camai"), 支持运行时热更新
 中继    : relayEnabled 默认关, relayFps 1-15 默认 8
           RELAY_HOST 为空时中继休眠不连接
